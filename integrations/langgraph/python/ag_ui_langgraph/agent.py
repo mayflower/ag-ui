@@ -295,11 +295,21 @@ class LangGraphAgent:
                     break
 
             if last_user_message:
-                return await self.prepare_regenerate_stream(
-                    input=input,
-                    message_checkpoint=last_user_message,
-                    config=config
-                )
+                # Fix for issue #706: Check if message ID exists in checkpoint before regenerating
+                # This distinguishes between regeneration (existing message) and thread resumption (new message)
+                checkpoint_message_ids = {
+                    getattr(msg, 'id', None)
+                    for msg in agent_state.values.get("messages", [])
+                }
+
+                # Only regenerate if message ID is found in history
+                if last_user_message.id in checkpoint_message_ids:
+                    return await self.prepare_regenerate_stream(
+                        input=input,
+                        message_checkpoint=last_user_message,
+                        config=config
+                    )
+                # Otherwise, continue with normal thread resumption (fall through)
 
         events_to_dispatch = []
         if has_active_interrupts and not resume_input:
@@ -385,9 +395,11 @@ class LangGraphAgent:
         stream_input = self.langgraph_default_merge_state(time_travel_checkpoint.values, [message_checkpoint], input)
         subgraphs_stream_enabled = input.forwarded_props.get('stream_subgraphs') if input.forwarded_props else False
 
+        # Fix for PR #833: Pass fork as config, not as separate fork parameter
+        # This ensures configurable data is properly nested under the config key
         kwargs = self.get_stream_kwargs(
             input=stream_input,
-            fork=fork,
+            config=fork,
             subgraphs=bool(subgraphs_stream_enabled),
             version="v2",
         )
