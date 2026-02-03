@@ -320,6 +320,53 @@ def normalize_tool_content(content: Any) -> str:
 def camel_to_snake(name):
     return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
 
+
+def filter_injected_state_params(tool_input: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Filter out InjectedState-annotated parameters from tool input before serialization.
+
+    This addresses the issue where LangGraph tools with InjectedState parameters
+    (e.g., `state: Annotated[AgentState, InjectedState]`) cause serialization failures
+    when the AG-UI protocol tries to emit TOOL_CALL_ARGS events.
+
+    The state is only needed at runtime and should not be serialized to the UI.
+    This also improves security by not exposing internal state (user IDs, etc.) to the frontend.
+
+    See: https://github.com/ag-ui-protocol/ag-ui/issues/519
+
+    Filters out:
+    - Parameters starting with '_' (convention for injected params like _state, _config)
+    - Parameters containing LangChain message types (HumanMessage, AIMessage, etc.)
+    - Parameters that are RunnableConfig objects
+    """
+    if not isinstance(tool_input, dict):
+        return tool_input
+
+    filtered = {}
+    for key, value in tool_input.items():
+        # Skip parameters starting with underscore (common convention for injected params)
+        if key.startswith('_'):
+            continue
+
+        # Skip if value is a LangChain message or list of messages
+        if isinstance(value, BaseMessage):
+            continue
+        if isinstance(value, list) and value and isinstance(value[0], BaseMessage):
+            continue
+
+        # Skip RunnableConfig-like objects (have 'configurable' key or are RunnableConfig type)
+        if isinstance(value, dict) and 'configurable' in value:
+            continue
+
+        # Skip if the value has typical state attributes (messages, tools keys)
+        if isinstance(value, dict) and 'messages' in value and isinstance(value.get('messages'), list):
+            # Likely an injected state object
+            continue
+
+        filtered[key] = value
+
+    return filtered
+
 def json_safe_stringify(o):
     if is_dataclass(o):          # dataclasses like Flight(...)
         return asdict(o)

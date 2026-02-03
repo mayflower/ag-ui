@@ -30,6 +30,7 @@ from .utils import (
     agui_messages_to_langchain,
     DEFAULT_SCHEMA_KEYS,
     filter_object_by_schema_keys,
+    filter_injected_state_params,
     get_stream_payload_input,
     langchain_messages_to_agui,
     resolve_reasoning_content,
@@ -722,7 +723,7 @@ class LangGraphAgent:
                             ToolCallArgsEvent(
                                 type=EventType.TOOL_CALL_ARGS,
                                 tool_call_id=tool_msg.tool_call_id,
-                                delta=json.dumps(event["data"].get("input", {})),
+                                delta=dump_json_safe(filter_injected_state_params(event["data"].get("input", {}))),
                                 raw_event=event
                             )
                         )
@@ -759,7 +760,7 @@ class LangGraphAgent:
                     ToolCallArgsEvent(
                         type=EventType.TOOL_CALL_ARGS,
                         tool_call_id=tool_call_output.tool_call_id,
-                        delta=dump_json_safe(event["data"]["input"]),
+                        delta=dump_json_safe(filter_injected_state_params(event["data"]["input"])),
                         raw_event=event
                     )
                 )
