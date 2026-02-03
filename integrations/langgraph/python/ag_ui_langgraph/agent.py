@@ -504,6 +504,9 @@ class LangGraphAgent:
 
     async def _handle_single_event(self, event: Any, state: State) -> AsyncGenerator[str, None]:
         event_type = event.get("event")
+        # Debug: log ALL events to help diagnose custom event issues
+        if event_type == "on_custom_event":
+            logger.info(f"[AG-UI DEBUG] Custom event received: type={event_type}, name={event.get('name')}, keys={list(event.keys())}")
         if event_type == LangGraphEventTypes.OnChatModelStream:
             should_emit_messages = event["metadata"].get("emit-messages", True)
             should_emit_tool_calls = event["metadata"].get("emit-tool-calls", True)
