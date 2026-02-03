@@ -1,7 +1,10 @@
 import uuid
 import json
+import logging
 from typing import Optional, List, Any, Union, AsyncGenerator, Generator, Literal, Dict
 import inspect
+
+logger = logging.getLogger(__name__)
 
 from langgraph.graph.state import CompiledStateGraph
 
