@@ -650,6 +650,7 @@ class LangGraphAgent:
                 yield resolved
 
         elif event_type == LangGraphEventTypes.OnCustomEvent:
+            logger.info(f"[AG-UI] OnCustomEvent received: name={event.get('name')}")
             if event["name"] == CustomEventNames.ManuallyEmitMessage:
                 yield self._dispatch_event(
                     TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, role="assistant", message_id=event["data"]["message_id"], raw_event=event)
@@ -690,7 +691,10 @@ class LangGraphAgent:
                 )
 
             elif event["name"] == CustomEventNames.ManuallyEmitState or event["name"] == CustomEventNames.CopilotKitManuallyEmitState:
+                logger.info(f"[AG-UI] Received manual state emit event: {event['name']}")
                 self.active_run["manually_emitted_state"] = event["data"]
+                state_keys = list(event["data"].keys()) if isinstance(event["data"], dict) else "non-dict"
+                logger.info(f"[AG-UI] Emitting STATE_SNAPSHOT with keys: {state_keys}")
                 yield self._dispatch_event(
                     StateSnapshotEvent(type=EventType.STATE_SNAPSHOT, snapshot=self.get_state_snapshot(self.active_run["manually_emitted_state"]), raw_event=event)
                 )
