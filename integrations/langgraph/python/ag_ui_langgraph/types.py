@@ -18,7 +18,10 @@ class CustomEventNames(str, Enum):
     ManuallyEmitMessage = "manually_emit_message"
     ManuallyEmitToolCall = "manually_emit_tool_call"
     ManuallyEmitState = "manually_emit_state"
+    # CopilotKit compatibility - same behavior as ManuallyEmitState
+    CopilotKitManuallyEmitState = "copilotkit_manually_emit_intermediate_state"
     Exit = "exit"
+    CopilotKitExit = "copilotkit_exit"
 
 State = Dict[str, Any]
 

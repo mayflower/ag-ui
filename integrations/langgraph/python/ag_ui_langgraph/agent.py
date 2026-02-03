@@ -689,7 +689,7 @@ class LangGraphAgent:
                     ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=event["data"]["id"], raw_event=event)
                 )
 
-            elif event["name"] == CustomEventNames.ManuallyEmitState:
+            elif event["name"] == CustomEventNames.ManuallyEmitState or event["name"] == CustomEventNames.CopilotKitManuallyEmitState:
                 self.active_run["manually_emitted_state"] = event["data"]
                 yield self._dispatch_event(
                     StateSnapshotEvent(type=EventType.STATE_SNAPSHOT, snapshot=self.get_state_snapshot(self.active_run["manually_emitted_state"]), raw_event=event)
