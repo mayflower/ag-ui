@@ -13,6 +13,7 @@ interface RunHttpAgentConfig extends RunAgentParameters {
 
 export class HttpAgent extends AbstractAgent {
   public url: string;
+  public connectUrl?: string;
   public headers: Record<string, string>;
   public abortController: AbortController = new AbortController();
 
@@ -51,6 +52,7 @@ export class HttpAgent extends AbstractAgent {
   constructor(config: HttpAgentConfig) {
     super(config);
     this.url = config.url;
+    this.connectUrl = config.connectUrl;
     this.headers = structuredClone_(config.headers ?? {});
   }
 
@@ -59,9 +61,16 @@ export class HttpAgent extends AbstractAgent {
     return transformHttpEventStream(httpEvents);
   }
 
+  protected connect(input: RunAgentInput): Observable<BaseEvent> {
+    const baseUrl = this.connectUrl ?? `${this.url.replace(/\/$/, "")}/connect`;
+    const httpEvents = runHttpRequest(baseUrl, this.requestInit(input));
+    return transformHttpEventStream(httpEvents);
+  }
+
   public clone(): HttpAgent {
     const cloned = super.clone() as HttpAgent;
     cloned.url = this.url;
+    cloned.connectUrl = this.connectUrl;
     cloned.headers = structuredClone_(this.headers ?? {});
 
     const newController = new AbortController();

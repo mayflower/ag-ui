@@ -20,6 +20,7 @@ When creating an HTTP agent, you need to provide an `HttpAgentConfig` object:
 ```typescript
 interface HttpAgentConfig extends AgentConfig {
   url: string // Endpoint URL for the agent service
+  connectUrl?: string // Optional override for the connect endpoint URL
   headers?: Record<string, string> // Optional HTTP headers
 }
 ```
@@ -29,6 +30,8 @@ interface HttpAgentConfig extends AgentConfig {
 ```typescript
 const agent = new HttpAgent({
   url: "https://api.example.com/v1/agent",
+  // Optional: override connect endpoint (defaults to `${url}/connect`)
+  connectUrl: "https://api.example.com/v1/agent/connect",
   headers: {
     Authorization: "Bearer your-api-key",
   },
@@ -59,6 +62,16 @@ interface RunAgentResult {
   result: any // The final result returned by the agent
   newMessages: Message[] // New messages added during this run
 }
+
+### connectAgent()
+
+Establishes a persistent connection to load existing thread state and messages.
+This sends a request to `connectUrl` if provided, otherwise `${url}/connect`,
+and expects an AG-UI event stream (e.g. `MESSAGES_SNAPSHOT`).
+
+```typescript
+connectAgent(parameters?: RunAgentParameters, subscriber?: AgentSubscriber): Promise<RunAgentResult>
+```
 ```
 
 ### subscribe()
