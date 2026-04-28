@@ -1,0 +1,96 @@
+name: Publish MCP Apps Middleware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "middlewares/mcp-apps-middleware/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/publish-mcp-apps-middleware.yml"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and test without publishing"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-mcp-apps-middleware
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: github.repository == 'mayflower/ag-ui'
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build package (with dependencies via nx)
+        run: npx nx build @mayflowergmbh/ag-ui-mcp-apps-middleware
+
+      - name: Typecheck package
+        run: pnpm --filter @mayflowergmbh/ag-ui-mcp-apps-middleware typecheck
+
+      - name: Test package
+        run: pnpm --filter @mayflowergmbh/ag-ui-mcp-apps-middleware test
+
+      - name: Detect publish necessity
+        id: detect
+        shell: bash
+        run: |
+          PKG_NAME=$(node -p "require('./middlewares/mcp-apps-middleware/package.json').name")
+          PKG_VERSION=$(node -p "require('./middlewares/mcp-apps-middleware/package.json').version")
+          PUBLISHED_VERSION=$(npm view "$PKG_NAME" version 2>/dev/null || true)
+
+          echo "name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$PUBLISHED_VERSION" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "No published version found for $PKG_NAME" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$PUBLISHED_VERSION" = "$PKG_VERSION" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "$PKG_NAME@$PKG_VERSION is already published" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Publishing $PKG_NAME@$PKG_VERSION (npm has $PUBLISHED_VERSION)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish package
+        if: steps.detect.outputs.publish == 'true' && github.event.inputs.dry_run != 'true'
+        working-directory: middlewares/mcp-apps-middleware
+        run: npx -y npm@latest publish --access public --provenance --tag latest
+
+      - name: Dry run summary
+        if: steps.detect.outputs.publish == 'true' && github.event.inputs.dry_run == 'true'
+        run: |
+          echo "Dry run only: skipping npm publish for ${{ steps.detect.outputs.name }}@${{ steps.detect.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"

@@ -51,6 +51,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    if: github.repository == 'ag-ui-protocol/ag-ui'
     environment: npm
     permissions:
       contents: read

@@ -70,6 +70,12 @@ while read -r pkg; do
     continue
   fi
 
+  # Skip middlewares/* packages - these use dedicated publish workflows
+  if [[ "$RELATIVE_PATH" == middlewares/* ]]; then
+    echo "SKIP (middleware): $NAME" >&2
+    continue
+  fi
+
   # Skip mastra examples
   if [[ "$RELATIVE_PATH" == *examples* ]]; then
     echo "SKIP (example): $NAME" >&2
