@@ -1,6 +1,14 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 import { vi } from "vitest";
-import { AbstractAgent, BaseEvent, EventType, RunAgentInput, Message, Tool, AssistantMessage } from "@ag-ui/client";
+import {
+  AbstractAgent,
+  BaseEvent,
+  EventType,
+  RunAgentInput,
+  Message,
+  Tool,
+  AssistantMessage,
+} from "@ag-ui/client";
 import { Observable } from "rxjs";
 import { firstValueFrom, toArray } from "rxjs";
 
@@ -48,7 +56,7 @@ export interface MockMCPTool {
 export function createMCPToolWithUI(
   name: string,
   resourceUri: string,
-  description?: string
+  description?: string,
 ): MockMCPTool {
   return {
     name,
@@ -59,9 +67,48 @@ export function createMCPToolWithUI(
 }
 
 /**
+ * Create an MCP tool with preferred nested UI metadata.
+ */
+export function createMCPToolWithNestedUI(
+  name: string,
+  resourceUri: string,
+  description?: string,
+): MockMCPTool {
+  return {
+    name,
+    description: description || `Tool ${name}`,
+    inputSchema: { type: "object", properties: {} },
+    _meta: { ui: { resourceUri } },
+  };
+}
+
+/**
+ * Create an MCP tool with both nested and flat UI metadata.
+ */
+export function createMCPToolWithBothUI(
+  name: string,
+  nestedResourceUri: string,
+  flatResourceUri: string,
+  description?: string,
+): MockMCPTool {
+  return {
+    name,
+    description: description || `Tool ${name}`,
+    inputSchema: { type: "object", properties: {} },
+    _meta: {
+      ui: { resourceUri: nestedResourceUri },
+      "ui/resourceUri": flatResourceUri,
+    },
+  };
+}
+
+/**
  * Create an MCP tool without UI resource
  */
-export function createMCPToolWithoutUI(name: string, description?: string): MockMCPTool {
+export function createMCPToolWithoutUI(
+  name: string,
+  description?: string,
+): MockMCPTool {
   return {
     name,
     description: description || `Tool ${name}`,
@@ -78,6 +125,21 @@ export function createMCPToolWithEmptyMeta(name: string): MockMCPTool {
     description: `Tool ${name}`,
     inputSchema: { type: "object", properties: {} },
     _meta: { someOtherField: "value" },
+  };
+}
+
+/**
+ * Create an MCP tool with invalid UI metadata.
+ */
+export function createMCPToolWithInvalidUI(
+  name: string,
+  resourceUri: unknown,
+): MockMCPTool {
+  return {
+    name,
+    description: `Tool ${name}`,
+    inputSchema: { type: "object", properties: {} },
+    _meta: { ui: { resourceUri } },
   };
 }
 
@@ -170,7 +232,9 @@ export class ErrorMockAgent extends AbstractAgent {
 /**
  * Create a basic RunAgentInput for testing
  */
-export function createRunAgentInput(overrides: Partial<RunAgentInput> = {}): RunAgentInput {
+export function createRunAgentInput(
+  overrides: Partial<RunAgentInput> = {},
+): RunAgentInput {
   return {
     threadId: "test-thread",
     runId: "test-run",
@@ -188,7 +252,7 @@ export function createRunAgentInput(overrides: Partial<RunAgentInput> = {}): Run
  */
 export function createRunStartedEvent(
   runId: string = "test-run",
-  threadId: string = "test-thread"
+  threadId: string = "test-thread",
 ): BaseEvent {
   return {
     type: EventType.RUN_STARTED,
@@ -203,7 +267,7 @@ export function createRunStartedEvent(
 export function createRunFinishedEvent(
   runId: string = "test-run",
   threadId: string = "test-thread",
-  result?: unknown
+  result?: unknown,
 ): BaseEvent {
   return {
     type: EventType.RUN_FINISHED,
@@ -216,7 +280,9 @@ export function createRunFinishedEvent(
 /**
  * Create a TEXT_MESSAGE_START event
  */
-export function createTextMessageStartEvent(messageId: string = "msg-1"): BaseEvent {
+export function createTextMessageStartEvent(
+  messageId: string = "msg-1",
+): BaseEvent {
   return {
     type: EventType.TEXT_MESSAGE_START,
     messageId,
@@ -229,7 +295,7 @@ export function createTextMessageStartEvent(messageId: string = "msg-1"): BaseEv
  */
 export function createTextMessageContentEvent(
   messageId: string = "msg-1",
-  delta: string = "Hello"
+  delta: string = "Hello",
 ): BaseEvent {
   return {
     type: EventType.TEXT_MESSAGE_CONTENT,
@@ -241,7 +307,9 @@ export function createTextMessageContentEvent(
 /**
  * Create a TEXT_MESSAGE_END event
  */
-export function createTextMessageEndEvent(messageId: string = "msg-1"): BaseEvent {
+export function createTextMessageEndEvent(
+  messageId: string = "msg-1",
+): BaseEvent {
   return {
     type: EventType.TEXT_MESSAGE_END,
     messageId,
@@ -254,7 +322,7 @@ export function createTextMessageEndEvent(messageId: string = "msg-1"): BaseEven
 export function createToolCallStartEvent(
   toolCallId: string,
   toolCallName: string,
-  parentMessageId?: string
+  parentMessageId?: string,
 ): BaseEvent {
   return {
     type: EventType.TOOL_CALL_START,
@@ -267,7 +335,10 @@ export function createToolCallStartEvent(
 /**
  * Create a TOOL_CALL_ARGS event
  */
-export function createToolCallArgsEvent(toolCallId: string, delta: string): BaseEvent {
+export function createToolCallArgsEvent(
+  toolCallId: string,
+  delta: string,
+): BaseEvent {
   return {
     type: EventType.TOOL_CALL_ARGS,
     toolCallId,
@@ -291,7 +362,7 @@ export function createToolCallEndEvent(toolCallId: string): BaseEvent {
 export function createToolCallResultEvent(
   toolCallId: string,
   content: string,
-  messageId: string = `result-${toolCallId}`
+  messageId: string = `result-${toolCallId}`,
 ): BaseEvent {
   return {
     type: EventType.TOOL_CALL_RESULT,
@@ -305,8 +376,12 @@ export function createToolCallResultEvent(
  * Create an assistant message with tool calls
  */
 export function createAssistantMessageWithToolCalls(
-  toolCalls: Array<{ name: string; args?: Record<string, unknown>; id?: string }>,
-  messageId?: string
+  toolCalls: Array<{
+    name: string;
+    args?: Record<string, unknown>;
+    id?: string;
+  }>,
+  messageId?: string,
 ): AssistantMessage {
   return {
     id: messageId || `msg-${Math.random().toString(36).substr(2, 9)}`,
@@ -329,7 +404,7 @@ export function createAssistantMessageWithToolCalls(
 export function createToolResultMessage(
   toolCallId: string,
   content: string,
-  messageId?: string
+  messageId?: string,
 ): Message {
   return {
     id: messageId || `msg-${Math.random().toString(36).substr(2, 9)}`,
@@ -353,7 +428,9 @@ export function createAGUITool(name: string, description?: string): Tool {
 /**
  * Collect all events from an Observable
  */
-export async function collectEvents(observable: Observable<BaseEvent>): Promise<BaseEvent[]> {
+export async function collectEvents(
+  observable: Observable<BaseEvent>,
+): Promise<BaseEvent[]> {
   return firstValueFrom(observable.pipe(toArray()));
 }
 
@@ -361,9 +438,20 @@ export async function collectEvents(observable: Observable<BaseEvent>): Promise<
  * Create MCP tool call result (what callTool returns)
  */
 export function createMCPToolCallResult(
-  content: Array<{ type: string; text?: string; [key: string]: unknown }>
-): { content: Array<{ type: string; text?: string; [key: string]: unknown }> } {
-  return { content };
+  content: Array<{ type: string; text?: string; [key: string]: unknown }>,
+  options?: {
+    structuredContent?: Record<string, unknown>;
+  },
+): {
+  content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+  structuredContent?: Record<string, unknown>;
+} {
+  return {
+    content,
+    ...(options?.structuredContent
+      ? { structuredContent: options.structuredContent }
+      : {}),
+  };
 }
 
 /**
@@ -372,7 +460,7 @@ export function createMCPToolCallResult(
 export function createMCPResourceResult(
   uri: string,
   mimeType: string,
-  text: string
+  text: string,
 ): { contents: Array<{ uri: string; mimeType: string; text: string }> } {
   return {
     contents: [{ uri, mimeType, text }],
@@ -385,7 +473,7 @@ export function createMCPResourceResult(
 export async function waitForCondition(
   condition: () => boolean,
   timeout: number = 1000,
-  interval: number = 10
+  interval: number = 10,
 ): Promise<void> {
   const start = Date.now();
   while (!condition()) {
