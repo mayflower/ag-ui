@@ -1146,7 +1146,7 @@ importers:
   middlewares/mcp-apps-middleware:
     dependencies:
       '@modelcontextprotocol/sdk':
-        specifier: ^1.0.0
+        specifier: ^1.20.0
         version: 1.20.0
     devDependencies:
       '@ag-ui/client':
@@ -13837,7 +13837,7 @@ snapshots:
       '@copilotkit/shared': 1.55.1(@ag-ui/core@0.0.52)
       phoenix: 1.8.5
       rxjs: 7.8.1
-      zod-to-json-schema: 3.24.6(zod@3.25.76)
+      zod-to-json-schema: 3.25.2(zod@3.25.76)
     transitivePeerDependencies:
       - '@ag-ui/core'
       - encoding
@@ -15670,7 +15670,7 @@ snapshots:
       pkce-challenge: 5.0.0
       raw-body: 3.0.1
       zod: 3.25.76
-      zod-to-json-schema: 3.24.6(zod@3.25.76)
+      zod-to-json-schema: 3.25.2(zod@3.25.76)
     transitivePeerDependencies:
       - supports-color
 
