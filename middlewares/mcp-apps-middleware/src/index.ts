@@ -146,12 +146,17 @@ type RunNextWithStateReturn = ReturnType<Middleware["runNextWithState"]>;
 export type EventWithState = ExtractObservableType<RunNextWithStateReturn>;
 
 /**
- * UI Tool with its source server config and resource URI
+ * UI Tool with its source server config and (optional) resource URI.
+ *
+ * `resourceUri` is omitted when the tool was injected from a server with
+ * `includeToolsWithoutResource: true` and the tool itself has no
+ * `_meta.ui.resourceUri`. In that mode the activity-snapshot emit is
+ * suppressed because the snapshot has no `resourceUri` to advertise.
  */
 interface UIToolInfo {
   tool: Tool;
   serverConfig: MCPClientConfig;
-  resourceUri: string;
+  resourceUri?: string;
 }
 
 /**
@@ -170,6 +175,20 @@ export interface MCPClientConfigHTTP {
    * activity-snapshot driven surface does not double-mount the widget.
    */
   emitActivity?: boolean;
+  /**
+   * Treat this server as a general tool catalog source rather than a
+   * SEP-1865 UI-only tool source. Defaults to false.
+   *
+   * When true, tools without `_meta.ui.resourceUri` are still injected into
+   * the agent's tool catalog. Use this when the host renders the tool result
+   * itself (for example via a tool-call renderer reading streamed args) and
+   * therefore does not need the MCP Apps activity surface for that tool.
+   * The middleware suppresses the final ACTIVITY_SNAPSHOT for tools that
+   * have no `resourceUri` (neither tool-linked nor result-scoped via
+   * `structuredContent.resourceUri`); the TOOL_CALL_RESULT event still
+   * emits, so the host can react to it normally.
+   */
+  includeToolsWithoutResource?: boolean;
 }
 
 /**
@@ -182,6 +201,8 @@ export interface MCPClientConfigSSE {
   serverId?: string;
   /** See {@link MCPClientConfigHTTP.emitActivity}. */
   emitActivity?: boolean;
+  /** See {@link MCPClientConfigHTTP.includeToolsWithoutResource}. */
+  includeToolsWithoutResource?: boolean;
 }
 
 /**
@@ -833,16 +854,23 @@ export class MCPAppsMiddleware extends Middleware {
 
       // Emit final activity snapshot. Skip when the caller opted out via
       // emitActivity=false — they render the widget themselves from the
-      // tool-call args.
-      if (toolInfo.serverConfig.emitActivity !== false) {
+      // tool-call args. Also skip when no resourceUri is available (neither
+      // tool-linked nor result-scoped); that only happens for tools surfaced
+      // via includeToolsWithoutResource, where there is nothing meaningful
+      // to put in `content.resourceUri`.
+      const effectiveResourceUri =
+        getToolResultUIResourceUri(mcpResult) ?? toolInfo.resourceUri;
+      if (
+        effectiveResourceUri &&
+        toolInfo.serverConfig.emitActivity !== false
+      ) {
         const activityEvent: ActivitySnapshotEvent = {
           type: EventType.ACTIVITY_SNAPSHOT,
           messageId: randomUUID(),
           activityType: MCPAppsActivityType,
           content: {
             result: mcpResult,
-            resourceUri:
-              getToolResultUIResourceUri(mcpResult) || toolInfo.resourceUri,
+            resourceUri: effectiveResourceUri,
             serverHash: getServerHash(toolInfo.serverConfig),
             serverId: toolInfo.serverConfig.serverId,
             toolInput: args,
@@ -976,10 +1004,16 @@ export class MCPAppsMiddleware extends Middleware {
       // Fetch tools from the server
       const response = await client.listTools();
 
-      // Filter for tools with UI resources and convert to AG-UI format with server config
+      // Filter for tools with UI resources and convert to AG-UI format with
+      // server config. Servers configured with includeToolsWithoutResource
+      // also surface tools that lack `_meta.ui.resourceUri` so the host can
+      // expose the server as a general tool catalog (the activity emit is
+      // suppressed downstream for those, since there's no resourceUri to
+      // advertise in the snapshot).
+      const includeAll = serverConfig.includeToolsWithoutResource === true;
       const uiTools = response.tools.flatMap((mcpTool) => {
         const resourceUri = getToolUIResourceUri(mcpTool);
-        if (!resourceUri) {
+        if (!resourceUri && !includeAll) {
           return [];
         }
 

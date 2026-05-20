@@ -1,6 +1,6 @@
 {
   "name": "@mayflowergmbh/ag-ui-mcp-apps-middleware",
-  "version": "0.0.7-mayflower.0",
+  "version": "0.0.8-mayflower.0",
   "description": "AG-UI middleware that exposes UI-enabled tools from MCP (Model Context Protocol) servers. Discovers MCP Apps tools, forwards progress notifications, executes tool calls in parallel, and emits AG-UI activity snapshots for frontend rendering.",
   "license": "MIT",
   "author": "Markus Ecker",

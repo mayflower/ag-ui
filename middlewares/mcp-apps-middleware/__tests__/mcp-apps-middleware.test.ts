@@ -3075,4 +3075,163 @@ describe("MCPAppsMiddleware", () => {
       expect(lastFinished(events).result.error).toBe("specific SDK error");
     });
   });
+
+  // =============================================================================
+  // 11. includeToolsWithoutResource: passthrough catalog mode
+  // =============================================================================
+  describe("Catalog passthrough (includeToolsWithoutResource)", () => {
+    const httpServerConfig: MCPClientConfig = {
+      type: "http",
+      url: "http://localhost:3000/mcp",
+    };
+
+    it("injects tools without ui/resourceUri when the flag is set", async () => {
+      mockListTools.mockResolvedValue({
+        tools: [createMCPToolWithoutUI("plain-tool", "A plain tool")],
+      });
+
+      const middleware = new MCPAppsMiddleware({
+        mcpServers: [
+          { ...httpServerConfig, includeToolsWithoutResource: true },
+        ],
+      });
+      const agent = new MockAgent([
+        createRunStartedEvent(),
+        createRunFinishedEvent(),
+      ]);
+
+      await collectEvents(middleware.run(createRunAgentInput(), agent));
+
+      const tools = agent.runCalls[0].tools;
+      expect(tools).toHaveLength(1);
+      expect(tools[0].name).toBe("plain-tool");
+      // No "[UI Resource: ...]" suffix is appended when there's no resourceUri.
+      expect(tools[0].description).not.toContain("UI Resource");
+    });
+
+    it("emits TOOL_CALL_RESULT but no ACTIVITY_SNAPSHOT for resource-less tools", async () => {
+      mockListTools.mockResolvedValue({
+        tools: [createMCPToolWithoutUI("plain-tool")],
+      });
+      mockCallTool.mockResolvedValue(
+        createMCPToolCallResult([{ type: "text", text: "ack" }]),
+      );
+
+      const middleware = new MCPAppsMiddleware({
+        mcpServers: [
+          { ...httpServerConfig, includeToolsWithoutResource: true },
+        ],
+      });
+      const assistantMsg = createAssistantMessageWithToolCalls([
+        { name: "plain-tool", args: { foo: 1 }, id: "tc-plain" },
+      ]);
+      const agent = new MockAgent([
+        createRunStartedEvent(),
+        createRunFinishedEvent(),
+      ]);
+      const input = createRunAgentInput({ messages: [assistantMsg] });
+
+      const events = await collectEvents(middleware.run(input, agent));
+
+      const toolResultEvents = events.filter(
+        (e) => e.type === EventType.TOOL_CALL_RESULT,
+      );
+      const activityEvents = events.filter(
+        (e) =>
+          e.type === EventType.ACTIVITY_SNAPSHOT &&
+          (e as { activityType?: string }).activityType ===
+            MCPAppsActivityType,
+      );
+
+      expect(toolResultEvents).toHaveLength(1);
+      expect(activityEvents).toHaveLength(0);
+    });
+
+    it("still emits ACTIVITY_SNAPSHOT for UI tools alongside resource-less tools on the same server", async () => {
+      mockListTools.mockResolvedValue({
+        tools: [
+          createMCPToolWithUI("ui-tool", "ui://server/widget"),
+          createMCPToolWithoutUI("plain-tool"),
+        ],
+      });
+      mockCallTool.mockResolvedValue(
+        createMCPToolCallResult([{ type: "text", text: "ok" }]),
+      );
+
+      const middleware = new MCPAppsMiddleware({
+        mcpServers: [
+          { ...httpServerConfig, includeToolsWithoutResource: true },
+        ],
+      });
+      const assistantMsg = createAssistantMessageWithToolCalls([
+        { name: "ui-tool", args: {}, id: "tc-ui" },
+        { name: "plain-tool", args: {}, id: "tc-plain" },
+      ]);
+      const agent = new MockAgent([
+        createRunStartedEvent(),
+        createRunFinishedEvent(),
+      ]);
+      const input = createRunAgentInput({ messages: [assistantMsg] });
+
+      const events = await collectEvents(middleware.run(input, agent));
+
+      const toolResultEvents = events.filter(
+        (e) => e.type === EventType.TOOL_CALL_RESULT,
+      );
+      const activityEvents = events.filter(
+        (e) =>
+          e.type === EventType.ACTIVITY_SNAPSHOT &&
+          (e as { activityType?: string }).activityType ===
+            MCPAppsActivityType,
+      );
+
+      expect(toolResultEvents).toHaveLength(2);
+      // Exactly one activity snapshot — for the UI tool only.
+      expect(activityEvents).toHaveLength(1);
+      expect((activityEvents[0] as any).content.resourceUri).toBe(
+        "ui://server/widget",
+      );
+    });
+
+    it("emits ACTIVITY_SNAPSHOT when a resource-less tool's result carries structuredContent.resourceUri", async () => {
+      mockListTools.mockResolvedValue({
+        tools: [createMCPToolWithoutUI("plain-tool")],
+      });
+      mockCallTool.mockResolvedValue(
+        createMCPToolCallResult([{ type: "text", text: "ok" }], {
+          structuredContent: {
+            resourceUri: "ui://server/runtime-widget",
+          },
+        }),
+      );
+
+      const middleware = new MCPAppsMiddleware({
+        mcpServers: [
+          { ...httpServerConfig, includeToolsWithoutResource: true },
+        ],
+      });
+      const assistantMsg = createAssistantMessageWithToolCalls([
+        { name: "plain-tool", args: {}, id: "tc-plain" },
+      ]);
+      const agent = new MockAgent([
+        createRunStartedEvent(),
+        createRunFinishedEvent(),
+      ]);
+      const input = createRunAgentInput({ messages: [assistantMsg] });
+
+      const events = await collectEvents(middleware.run(input, agent));
+
+      const activityEvents = events.filter(
+        (e) =>
+          e.type === EventType.ACTIVITY_SNAPSHOT &&
+          (e as { activityType?: string }).activityType ===
+            MCPAppsActivityType,
+      );
+
+      expect(activityEvents).toHaveLength(1);
+      expect((activityEvents[0] as any).content.resourceUri).toBe(
+        "ui://server/runtime-widget",
+      );
+    });
+  });
 });

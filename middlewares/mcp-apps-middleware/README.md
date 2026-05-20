@@ -49,6 +49,7 @@ const agent = new YourAgent().use(
 - Supports proxied MCP requests for frontend resource fetching (`tools/call`, `tools/list`, `resources/read`, `resources/list`, `resources/templates/list`, `prompts/list`, `prompts/get`, `notifications/message`, `ping`)
 - Pluggable logger so transport / tool-execution failures route through the host's logging stack
 - Warns on tool name collisions across configured MCP servers
+- Optional per-server passthrough mode (`includeToolsWithoutResource`) for treating an MCP server as a general tool catalog source rather than a SEP-1865 UI-only source
 
 ## Configuration
 
@@ -67,6 +68,8 @@ type MCPClientConfig =
       serverId?: string;
       /** Skip the final ACTIVITY_SNAPSHOT emit. Default: true. */
       emitActivity?: boolean;
+      /** Inject tools without `_meta.ui.resourceUri`. Default: false. */
+      includeToolsWithoutResource?: boolean;
     }
   | {
       type: "sse";
@@ -74,6 +77,7 @@ type MCPClientConfig =
       headers?: Record<string, string>;
       serverId?: string;
       emitActivity?: boolean;
+      includeToolsWithoutResource?: boolean;
     };
 
 interface Logger {
@@ -91,6 +95,21 @@ interface Logger {
 ### `emitActivity`
 
 Set `emitActivity: false` for a server when the frontend renders the widget directly from the tool-call args (e.g. via a dedicated tool-call renderer). The middleware will still execute the tool call and emit `TOOL_CALL_RESULT`, but skip the final `ACTIVITY_SNAPSHOT` so the widget is not double-mounted.
+
+### `includeToolsWithoutResource`
+
+By default the middleware acts as a SEP-1865 UI-tool source: it filters the
+server's `tools/list` to only those that carry a `_meta.ui.resourceUri` (or the
+deprecated flat `_meta["ui/resourceUri"]`). Set
+`includeToolsWithoutResource: true` to instead treat the server as a general
+tool catalog source — tools without that metadata are also injected into the
+agent's tool list. The middleware still executes those tool calls normally and
+emits `TOOL_CALL_RESULT`; the final `ACTIVITY_SNAPSHOT` is suppressed for tools
+that have no `resourceUri` at all (neither tool-linked nor result-scoped via
+`structuredContent.resourceUri`), since the snapshot has no URI to advertise.
+This is the right setting when the host renders a tool's result via a frontend
+tool-call renderer (reading the streamed args) rather than via the MCP Apps
+activity surface.
 
 ### Logger
 
