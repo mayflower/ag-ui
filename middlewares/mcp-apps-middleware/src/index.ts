@@ -92,32 +92,20 @@ function patchOptional<T>(
 }
 
 /**
- * Pluggable logger surface. The middleware emits warnings on tool name
- * collisions and errors on transport / tool-execution failures. Hosts can
- * route these through their own logging stack instead of `console`.
- */
-export interface Logger {
-  warn: (message: string, context?: Record<string, unknown>) => void;
-  error: (
-    message: string,
-    error?: unknown,
-    context?: Record<string, unknown>,
-  ) => void;
-  info?: (message: string, context?: Record<string, unknown>) => void;
-  debug?: (message: string, context?: Record<string, unknown>) => void;
-}
-
-/**
  * Default logger that forwards to the global `console`. Arguments are only
  * forwarded when defined so existing tests asserting `console.error(msg, err)`
  * keep working without seeing trailing `undefined` slots.
  */
-const consoleLogger: Logger = {
-  warn: (message, context) => {
+const consoleLogger = {
+  warn: (message: string, context?: Record<string, unknown>) => {
     if (context !== undefined) console.warn(message, context);
     else console.warn(message);
   },
-  error: (message, error, context) => {
+  error: (
+    message: string,
+    error?: unknown,
+    context?: Record<string, unknown>,
+  ) => {
     if (context !== undefined) console.error(message, error, context);
     else if (error !== undefined) console.error(message, error);
     else console.error(message);
@@ -146,12 +134,7 @@ type RunNextWithStateReturn = ReturnType<Middleware["runNextWithState"]>;
 export type EventWithState = ExtractObservableType<RunNextWithStateReturn>;
 
 /**
- * UI Tool with its source server config and (optional) resource URI.
- *
- * `resourceUri` is omitted when the tool was injected from a server with
- * `includeToolsWithoutResource: true` and the tool itself has no
- * `_meta.ui.resourceUri`. In that mode the activity-snapshot emit is
- * suppressed because the snapshot has no `resourceUri` to advertise.
+ * UI Tool with its source server config and resource URI.
  */
 interface UIToolInfo {
   tool: Tool;
@@ -175,20 +158,6 @@ export interface MCPClientConfigHTTP {
    * activity-snapshot driven surface does not double-mount the widget.
    */
   emitActivity?: boolean;
-  /**
-   * Treat this server as a general tool catalog source rather than a
-   * SEP-1865 UI-only tool source. Defaults to false.
-   *
-   * When true, tools without `_meta.ui.resourceUri` are still injected into
-   * the agent's tool catalog. Use this when the host renders the tool result
-   * itself (for example via a tool-call renderer reading streamed args) and
-   * therefore does not need the MCP Apps activity surface for that tool.
-   * The middleware suppresses the final ACTIVITY_SNAPSHOT for tools that
-   * have no `resourceUri` (neither tool-linked nor result-scoped via
-   * `structuredContent.resourceUri`); the TOOL_CALL_RESULT event still
-   * emits, so the host can react to it normally.
-   */
-  includeToolsWithoutResource?: boolean;
 }
 
 /**
@@ -201,8 +170,6 @@ export interface MCPClientConfigSSE {
   serverId?: string;
   /** See {@link MCPClientConfigHTTP.emitActivity}. */
   emitActivity?: boolean;
-  /** See {@link MCPClientConfigHTTP.includeToolsWithoutResource}. */
-  includeToolsWithoutResource?: boolean;
 }
 
 /**
@@ -231,11 +198,6 @@ export interface MCPAppsMiddlewareConfig {
    * List of MCP server configurations
    */
   mcpServers?: MCPClientConfig[];
-  /**
-   * Optional logger for warnings and errors. Defaults to a console-based
-   * logger that forwards to `console.warn` / `console.error`.
-   */
-  logger?: Logger;
 }
 
 const MCP_APPS_RESOURCE_MIME_TYPES = [
@@ -296,11 +258,6 @@ interface MCPClientCacheEntry {
  */
 class MCPClientCache {
   private readonly entries = new Map<string, MCPClientCacheEntry>();
-  private readonly logger: Logger;
-
-  constructor(logger: Logger) {
-    this.logger = logger;
-  }
 
   get(serverConfig: MCPClientConfig): Promise<Client> {
     const key = getServerHash(serverConfig);
@@ -339,7 +296,7 @@ class MCPClientCache {
         try {
           await client.close();
         } catch (err) {
-          this.logger.error("Failed to close MCP client", err, {
+          consoleLogger.error("Failed to close MCP client", err, {
             serverId: serverConfig.serverId,
             serverHash: getServerHash(serverConfig),
           });
@@ -462,7 +419,6 @@ function convertMCPToolToAGUITool(mcpTool: {
  */
 export class MCPAppsMiddleware extends Middleware {
   private config: MCPAppsMiddlewareConfig;
-  private readonly logger: Logger;
   /** Map of serverHash -> server config for proxied requests */
   private serverConfigMapByHash: Map<string, MCPClientConfig> = new Map();
   /** Map of serverId -> server config for proxied requests */
@@ -471,7 +427,6 @@ export class MCPAppsMiddleware extends Middleware {
   constructor(config: MCPAppsMiddlewareConfig = {}) {
     super();
     this.config = config;
-    this.logger = config.logger ?? consoleLogger;
     // Build server config maps for proxied requests
     for (const serverConfig of config.mcpServers || []) {
       const serverHash = getServerHash(serverConfig);
@@ -507,7 +462,7 @@ export class MCPAppsMiddleware extends Middleware {
         for (const info of uiToolInfos) {
           const existing = uiToolsMap.get(info.tool.name);
           if (existing) {
-            this.logger.warn(
+            consoleLogger.warn(
               `[mcp-apps-middleware] Tool name collision: "${info.tool.name}" is exposed by multiple MCP servers. The previous server's tool will be shadowed.`,
               {
                 toolName: info.tool.name,
@@ -709,7 +664,7 @@ export class MCPAppsMiddleware extends Middleware {
           // Stream ended - do special processing if we have a held RunFinished
           if (heldRunFinished && !isProcessing) {
             isProcessing = true;
-            const clientCache = new MCPClientCache(this.logger);
+            const clientCache = new MCPClientCache();
 
             try {
               // Find tool calls that don't have a corresponding result message
@@ -742,7 +697,7 @@ export class MCPAppsMiddleware extends Middleware {
               );
               for (const result of settled) {
                 if (result.status === "rejected") {
-                  this.logger.error(
+                  consoleLogger.error(
                     "Unexpected error in pending UI tool call execution",
                     result.reason,
                   );
@@ -854,10 +809,11 @@ export class MCPAppsMiddleware extends Middleware {
 
       // Emit final activity snapshot. Skip when the caller opted out via
       // emitActivity=false — they render the widget themselves from the
-      // tool-call args. Also skip when no resourceUri is available (neither
-      // tool-linked nor result-scoped); that only happens for tools surfaced
-      // via includeToolsWithoutResource, where there is nothing meaningful
-      // to put in `content.resourceUri`.
+      // tool-call args. The resourceUri guard is defensive: every injected
+      // tool carries a tool-linked resourceUri, but a result may still
+      // resolve none if neither tool-linked nor result-scoped via
+      // `structuredContent.resourceUri`, in which case there is nothing
+      // meaningful to put in `content.resourceUri`.
       const effectiveResourceUri =
         getToolResultUIResourceUri(mcpResult) ?? toolInfo.resourceUri;
       if (
@@ -897,7 +853,7 @@ export class MCPAppsMiddleware extends Middleware {
     serverConfig: MCPClientConfig,
     error: unknown,
   ): void {
-    this.logger.error(`Failed to execute UI tool call ${toolName}:`, error, {
+    consoleLogger.error(`Failed to execute UI tool call ${toolName}:`, error, {
       toolName,
       toolCallId: toolCall.id,
       serverId: serverConfig.serverId,
@@ -979,7 +935,7 @@ export class MCPAppsMiddleware extends Middleware {
         allUITools.push(...result.value);
       } else {
         const serverConfig = servers[idx];
-        this.logger.error(
+        consoleLogger.error(
           `Failed to fetch tools from MCP server ${serverConfig.url}:`,
           result.reason,
         );
@@ -1004,16 +960,12 @@ export class MCPAppsMiddleware extends Middleware {
       // Fetch tools from the server
       const response = await client.listTools();
 
-      // Filter for tools with UI resources and convert to AG-UI format with
-      // server config. Servers configured with includeToolsWithoutResource
-      // also surface tools that lack `_meta.ui.resourceUri` so the host can
-      // expose the server as a general tool catalog (the activity emit is
-      // suppressed downstream for those, since there's no resourceUri to
-      // advertise in the snapshot).
-      const includeAll = serverConfig.includeToolsWithoutResource === true;
+      // Filter for tools with UI resources (per SEP-1865) and convert to
+      // AG-UI format with server config. Tools that lack
+      // `_meta.ui.resourceUri` (or the deprecated flat key) are skipped.
       const uiTools = response.tools.flatMap((mcpTool) => {
         const resourceUri = getToolUIResourceUri(mcpTool);
-        if (!resourceUri && !includeAll) {
+        if (!resourceUri) {
           return [];
         }
 

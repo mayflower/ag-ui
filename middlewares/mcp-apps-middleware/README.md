@@ -47,17 +47,13 @@ const agent = new YourAgent().use(
 - Executes pending UI tool calls in parallel and reuses one MCP client per server for the batch
 - Forwards MCP `notifications/progress` to AG-UI as incremental `ACTIVITY_SNAPSHOT` events
 - Supports proxied MCP requests for frontend resource fetching (`tools/call`, `tools/list`, `resources/read`, `resources/list`, `resources/templates/list`, `prompts/list`, `prompts/get`, `notifications/message`, `ping`)
-- Pluggable logger so transport / tool-execution failures route through the host's logging stack
 - Warns on tool name collisions across configured MCP servers
-- Optional per-server passthrough mode (`includeToolsWithoutResource`) for treating an MCP server as a general tool catalog source rather than a SEP-1865 UI-only source
 
 ## Configuration
 
 ```typescript
 interface MCPAppsMiddlewareConfig {
   mcpServers?: MCPClientConfig[];
-  /** Optional logger; defaults to a console-based logger. */
-  logger?: Logger;
 }
 
 type MCPClientConfig =
@@ -68,8 +64,6 @@ type MCPClientConfig =
       serverId?: string;
       /** Skip the final ACTIVITY_SNAPSHOT emit. Default: true. */
       emitActivity?: boolean;
-      /** Inject tools without `_meta.ui.resourceUri`. Default: false. */
-      includeToolsWithoutResource?: boolean;
     }
   | {
       type: "sse";
@@ -77,57 +71,16 @@ type MCPClientConfig =
       headers?: Record<string, string>;
       serverId?: string;
       emitActivity?: boolean;
-      includeToolsWithoutResource?: boolean;
     };
-
-interface Logger {
-  warn: (message: string, context?: Record<string, unknown>) => void;
-  error: (
-    message: string,
-    error?: unknown,
-    context?: Record<string, unknown>,
-  ) => void;
-  info?: (message: string, context?: Record<string, unknown>) => void;
-  debug?: (message: string, context?: Record<string, unknown>) => void;
-}
 ```
 
 ### `emitActivity`
 
 Set `emitActivity: false` for a server when the frontend renders the widget directly from the tool-call args (e.g. via a dedicated tool-call renderer). The middleware will still execute the tool call and emit `TOOL_CALL_RESULT`, but skip the final `ACTIVITY_SNAPSHOT` so the widget is not double-mounted.
 
-### `includeToolsWithoutResource`
-
-By default the middleware acts as a SEP-1865 UI-tool source: it filters the
-server's `tools/list` to only those that carry a `_meta.ui.resourceUri` (or the
-deprecated flat `_meta["ui/resourceUri"]`). Set
-`includeToolsWithoutResource: true` to instead treat the server as a general
-tool catalog source — tools without that metadata are also injected into the
-agent's tool list. The middleware still executes those tool calls normally and
-emits `TOOL_CALL_RESULT`; the final `ACTIVITY_SNAPSHOT` is suppressed for tools
-that have no `resourceUri` at all (neither tool-linked nor result-scoped via
-`structuredContent.resourceUri`), since the snapshot has no URI to advertise.
-This is the right setting when the host renders a tool's result via a frontend
-tool-call renderer (reading the streamed args) rather than via the MCP Apps
-activity surface.
-
-### Logger
-
-Pass a `logger` to route warnings (tool name collisions) and errors (transport / tool-execution failures) through your own logging stack. When omitted, the middleware falls back to `console.warn` / `console.error`.
-
-```typescript
-new MCPAppsMiddleware({
-  mcpServers: [...],
-  logger: {
-    warn: (msg, ctx) => log.warn({ msg, ...ctx }),
-    error: (msg, err, ctx) => log.error({ msg, err, ...ctx }),
-  },
-});
-```
-
 ### Tool name collisions
 
-If two configured servers expose a tool with the same name, the last one loaded wins. The middleware warns through the logger with both server hashes and IDs so the host can disambiguate. To avoid collisions, set distinct `serverId`s and either expose unique tool names server-side or namespace your tools.
+If two configured servers expose a tool with the same name, the last one loaded wins. The middleware warns through `console.warn` with both server hashes and IDs so the host can disambiguate. To avoid collisions, set distinct `serverId`s and either expose unique tool names server-side or namespace your tools.
 
 ### Tool Metadata
 
@@ -253,7 +206,7 @@ A final `mcp-apps` snapshot (with `replace: true`, on a different `messageId`) i
 
 - Pending UI tool calls are executed in parallel via `Promise.all`. Independent RPCs no longer block on each other.
 - A run-scoped MCP client cache reuses a single client per server across all of that run's tool calls — one connect/close per (server, run) instead of one per call.
-- Tool discovery (`fetchUITools`) queries all configured servers in parallel; a failure on one server is logged through the configured logger but does not block the others.
+- Tool discovery (`fetchUITools`) queries all configured servers in parallel; a failure on one server is logged through `console.error` but does not block the others.
 
 ## Proxied MCP Requests
 
@@ -283,7 +236,6 @@ import {
   type MCPClientConfigHTTP,
   type MCPClientConfigSSE,
   type ProxiedMCPRequest,
-  type Logger,
 } from "@mayflowergmbh/ag-ui-mcp-apps-middleware";
 ```
 
