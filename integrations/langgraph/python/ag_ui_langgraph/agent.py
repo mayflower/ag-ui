@@ -3596,6 +3596,18 @@ class LangGraphAgent:
                         self.active_run["id"],
                         MessageInProgress(id=public_parent_id, tool_call_id=public_call_id, tool_call_name=tool_call_data["name"])
                     )
+                    # A provider may include arguments in the first chunk.
+                    # Preserve that delta before returning from the start branch.
+                    # Backport of ag-ui-protocol/ag-ui#2464; fixes #2653.
+                    if tool_call_data.get("args"):
+                        yield self._dispatch_event(
+                            ToolCallArgsEvent(
+                                type=EventType.TOOL_CALL_ARGS,
+                                tool_call_id=public_call_id,
+                                delta=tool_call_data["args"],
+                                raw_event=event,
+                            )
+                        )
                 return
 
             if is_tool_call_args_event and should_emit_tool_calls:
