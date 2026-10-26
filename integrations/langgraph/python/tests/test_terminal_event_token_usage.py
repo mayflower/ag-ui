@@ -24,6 +24,7 @@ relative to the finish-reason early return is the thing most likely to break.
 
 import math
 import unittest
+import pytest
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -266,6 +267,28 @@ async def _drive(agent, stream_events, interrupts=None):
 async def _run(stream_events, interrupts=None, **agent_kwargs):
     agent = make_agent(**{"emit_raw_events": False, **agent_kwargs})
     return await _drive(agent, stream_events, interrupts=interrupts)
+
+
+@pytest.mark.asyncio
+async def test_internal_model_calls_preserve_usage_without_public_text_or_tools():
+    from langchain.agents.middleware.internal_call_transformer import internal_call_metadata
+
+    internal = _chunk_event(content="internal summary", usage_metadata=_usage(3, 1, 4))
+    internal["metadata"].update(internal_call_metadata())
+    internal["data"]["chunk"].tool_call_chunks = [
+        {"name": "private_tool", "id": "private-call", "index": 0, "args": "{}"}
+    ]
+    visible = _chunk_event(content="public answer")
+    visible["run_id"] = "public-model"
+    visible["metadata"].update({"lc_source": "summarization", "lc_internal_call": "spoofed"})
+    end = _model_end_event(run_id="public-model")
+    emitted = await _run([internal, visible, end])
+
+    assert "".join(event.delta for event in emitted if event.type == EventType.TEXT_MESSAGE_CONTENT) == "public answer"
+    assert not any(event.type == EventType.TOOL_CALL_START for event in emitted)
+    terminal = _terminal(emitted, EventType.RUN_FINISHED)
+    assert terminal.usage[0].input_tokens == 3
+    assert terminal.usage[0].output_tokens == 1
 
 
 def _terminal(emitted, event_type):

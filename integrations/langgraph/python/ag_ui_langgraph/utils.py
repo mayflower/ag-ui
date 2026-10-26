@@ -788,6 +788,12 @@ def langchain_messages_to_agui(messages: List[BaseMessage]) -> List[AGUIMessage]
                 role="user",
                 content=content,
                 name=message.name,
+                metadata={
+                    "langgraph": {
+                        "lc_source": "pinned_skill",
+                        "skill": make_json_safe(message.additional_kwargs.get("skill")),
+                    }
+                } if message.additional_kwargs.get("lc_source") == "pinned_skill" else None,
             ))
         elif isinstance(message, AIMessage):
             # Surface reasoning content blocks as standalone

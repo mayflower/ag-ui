@@ -18,6 +18,7 @@ except ImportError:
     
 from langchain_core.runnables import RunnableConfig, ensure_config
 from langchain_core.runnables.config import merge_configs
+from langchain.agents.middleware.internal_call_transformer import internal_call_metadata
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
@@ -1735,6 +1736,20 @@ class LangGraphAgent:
             current_graph_state = state
 
             async for event in stream:
+                # Native middleware-internal calls belong to tracing and usage,
+                # not the public assistant/tool stream. Match LangChain's
+                # process-local marker; lc_source alone is caller-controlled.
+                metadata = event.get("metadata") or {}
+                if (
+                    event.get("event", "").startswith("on_chat_model_")
+                    and metadata.get("lc_internal_call")
+                    == internal_call_metadata()["lc_internal_call"]
+                ):
+                    streamed = event["event"] == "on_chat_model_stream"
+                    output = (event.get("data") or {}).get("chunk" if streamed else "output")
+                    usage = output.get("usage_metadata") if isinstance(output, dict) else getattr(output, "usage_metadata", None)
+                    self._record_usage(event, usage, streamed=streamed)
+                    continue
                 subgraphs_stream_enabled = input.forwarded_props.get('stream_subgraphs', True) if input.forwarded_props else True
                 ns = (event.get("metadata") or {}).get("langgraph_checkpoint_ns", "")
                 # Derive which subgraph (if any) owns this event.

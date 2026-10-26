@@ -26,6 +26,20 @@ from ag_ui_langgraph.utils import (
 )
 
 
+def test_pinned_skill_metadata_is_preserved_without_unrelated_kwargs():
+    skill = {"name": "report", "path": "/skills/report/SKILL.md"}
+    message = HumanMessage(
+        id="pin-1",
+        content="Report instructions",
+        additional_kwargs={"lc_source": "pinned_skill", "skill": skill, "private": "secret"},
+    )
+    converted = langchain_messages_to_agui([message])[0]
+    assert converted.content == message.content
+    assert converted.metadata == {"langgraph": {"lc_source": "pinned_skill", "skill": skill}}
+    ordinary = langchain_messages_to_agui([HumanMessage(id="user-1", content="hello")])[0]
+    assert ordinary.metadata is None
+
+
 class TestAguiMessagesToLangchain(unittest.TestCase):
     """Tests for agui_messages_to_langchain()."""
 
