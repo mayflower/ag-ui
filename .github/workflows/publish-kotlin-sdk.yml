@@ -20,7 +20,6 @@ permissions:
 jobs:
   build-and-test:
     runs-on: macos-latest
-    if: github.repository == 'ag-ui-protocol/ag-ui'
 
     permissions:
       contents: read

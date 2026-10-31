@@ -14,7 +14,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: github.repository == 'ag-ui-protocol/ag-ui'
     permissions:
       contents: read
 
