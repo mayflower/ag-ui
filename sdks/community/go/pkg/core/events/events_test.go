@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -86,6 +87,105 @@ func TestRunEvents(t *testing.T) {
 		assert.Contains(t, string(jsonData), threadID)
 	})
 
+	t.Run("RunFinishedEventWithSuccessOutcome", func(t *testing.T) {
+		threadID := "thread-123"
+		runID := "run-456"
+
+		event := NewRunFinishedEventWithOptions(threadID, runID, WithSuccessOutcome())
+
+		assert.Equal(t, EventTypeRunFinished, event.Type())
+		require.NotNil(t, event.Outcome)
+		assert.Equal(t, RunFinishedOutcomeTypeSuccess, event.Outcome.Type)
+		assert.Nil(t, event.Outcome.Interrupts)
+		assert.NoError(t, event.Validate())
+
+		jsonData, err := event.ToJSON()
+		require.NoError(t, err)
+		assert.Contains(t, string(jsonData), `"type":"success"`)
+	})
+
+	t.Run("RunFinishedEventWithInterruptOutcome", func(t *testing.T) {
+		threadID := "thread-123"
+		runID := "run-456"
+		interrupts := []types.Interrupt{
+			{
+				ID:         "int-1",
+				Reason:     "tool_call",
+				Message:    "Approve this action?",
+				ToolCallID: "tc-1",
+				ResponseSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"approved": map[string]any{"type": "boolean"},
+					},
+				},
+				Metadata: map[string]any{
+					"adk": map[string]any{"confirmationCallId": "fc-1"},
+				},
+			},
+		}
+
+		event := NewRunFinishedEventWithOptions(threadID, runID, WithInterruptOutcome(interrupts))
+
+		assert.Equal(t, EventTypeRunFinished, event.Type())
+		require.NotNil(t, event.Outcome)
+		assert.Equal(t, RunFinishedOutcomeTypeInterrupt, event.Outcome.Type)
+		require.Len(t, event.Outcome.Interrupts, 1)
+		assert.Equal(t, "int-1", event.Outcome.Interrupts[0].ID)
+		assert.Equal(t, "tool_call", event.Outcome.Interrupts[0].Reason)
+		assert.Equal(t, "Approve this action?", event.Outcome.Interrupts[0].Message)
+		assert.Equal(t, "tc-1", event.Outcome.Interrupts[0].ToolCallID)
+		assert.NoError(t, event.Validate())
+
+		jsonData, err := event.ToJSON()
+		require.NoError(t, err)
+		assert.Contains(t, string(jsonData), `"type":"interrupt"`)
+		assert.Contains(t, string(jsonData), `"int-1"`)
+	})
+
+	t.Run("RunFinishedEventWithoutOutcome", func(t *testing.T) {
+		threadID := "thread-123"
+		runID := "run-456"
+
+		event := NewRunFinishedEvent(threadID, runID)
+
+		assert.Nil(t, event.Outcome)
+		assert.NoError(t, event.Validate())
+
+		jsonData, err := event.ToJSON()
+		require.NoError(t, err)
+		assert.NotContains(t, string(jsonData), "outcome")
+	})
+
+	t.Run("RunFinishedEventOutcomeJSON", func(t *testing.T) {
+		jsonData := []byte(`{
+			"type": "RUN_FINISHED",
+			"threadId": "t-1",
+			"runId": "r-1",
+			"outcome": {
+				"type": "interrupt",
+				"interrupts": [
+					{
+						"id": "int-1",
+						"reason": "tool_call",
+						"toolCallId": "tc-1"
+					}
+				]
+			}
+		}`)
+
+		event, err := EventFromJSON(jsonData)
+		require.NoError(t, err)
+
+		finished, ok := event.(*RunFinishedEvent)
+		require.True(t, ok)
+		require.NotNil(t, finished.Outcome)
+		assert.Equal(t, RunFinishedOutcomeTypeInterrupt, finished.Outcome.Type)
+		require.Len(t, finished.Outcome.Interrupts, 1)
+		assert.Equal(t, "int-1", finished.Outcome.Interrupts[0].ID)
+		assert.Equal(t, "tc-1", finished.Outcome.Interrupts[0].ToolCallID)
+	})
+
 	t.Run("RunErrorEvent", func(t *testing.T) {
 		message := "Something went wrong"
 		code := "ERROR_CODE"
@@ -139,12 +239,35 @@ func TestMessageEvents(t *testing.T) {
 		assert.Equal(t, EventTypeTextMessageStart, event.Type())
 		assert.Equal(t, messageID, event.MessageID)
 		assert.Equal(t, &role, event.Role)
+		assert.Empty(t, event.Name)
 		assert.NoError(t, event.Validate())
 
 		// Test without role
 		event2 := NewTextMessageStartEvent(messageID)
 		assert.Nil(t, event2.Role)
 		assert.NoError(t, event2.Validate())
+
+		// Test with name
+		name := "research-agent"
+		event3 := NewTextMessageStartEvent(messageID, WithRole("assistant"), WithName(name))
+		assert.Equal(t, name, event3.Name)
+		assert.NoError(t, event3.Validate())
+
+		jsonData, err := event3.ToJSON()
+		require.NoError(t, err)
+
+		var decoded map[string]interface{}
+		require.NoError(t, json.Unmarshal(jsonData, &decoded))
+		assert.Equal(t, name, decoded["name"])
+
+		// Test that omitting the name keeps it off the wire
+		jsonData, err = event2.ToJSON()
+		require.NoError(t, err)
+
+		decoded = map[string]interface{}{}
+		require.NoError(t, json.Unmarshal(jsonData, &decoded))
+		_, hasName := decoded["name"]
+		assert.False(t, hasName, "expected \"name\" to be omitted when unset")
 
 		// Test validation error
 		event.MessageID = ""

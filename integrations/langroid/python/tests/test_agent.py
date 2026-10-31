@@ -6,12 +6,17 @@ import unittest
 from unittest.mock import MagicMock
 
 from ag_ui.core import (
+    PROTOCOL_VERSION,
     EventType,
+    ImagePart,
     RunAgentInput,
+    TextPart,
+    UrlSource,
     UserMessage,
     ToolMessage as AgUiToolMessage,
     Tool,
 )
+from ag_ui.encoder import EventEncoder
 
 from ag_ui_langroid.agent import LangroidAgent
 from ag_ui_langroid.types import LangroidAgentConfig, ToolBehavior
@@ -149,6 +154,53 @@ class TestLangroidAgentExtractUserMessage(unittest.TestCase):
         result = self.agent._extract_user_message([msg])
         self.assertEqual(result, "Hello World")
 
+    def test_text_part_models_from_parsed_input(self):
+        # Regression: parsed 1.0 input carries TextPart models, not dicts, and
+        # used to collapse to the literal prompt "Hello".
+        input_data = RunAgentInput.model_validate({
+            "threadId": "t",
+            "runId": "r",
+            "messages": [{
+                "id": "m1",
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is"},
+                    {"type": "text", "text": "the weather?"},
+                ],
+            }],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        })
+        self.assertIsInstance(input_data.messages[0].content[0], TextPart)
+        result = self.agent._extract_user_message(input_data.messages)
+        self.assertEqual(result, "What is the weather?")
+
+    def test_media_parts_are_dropped_with_warning(self):
+        msg = _make_user_message([
+            TextPart(text="Describe this"),
+            ImagePart(source=UrlSource(value="https://example.com/cat.png")),
+        ])
+        with self.assertLogs("ag_ui_langroid.agent", level="WARNING") as logs:
+            result = self.agent._extract_user_message([msg])
+        self.assertEqual(result, "Describe this")
+        self.assertTrue(any("image" in line for line in logs.output))
+
+    def test_run_forwards_text_part_content_to_llm(self):
+        received = []
+
+        class TrackingAgent:
+            message_history = []
+
+            def llm_response(self, msg):
+                received.append(msg)
+                return FakeLLMResponse("ok")
+
+        agent = LangroidAgent(agent=TrackingAgent(), name="test")
+        msg = _make_user_message([TextPart(text="Hi"), TextPart(text="there")])
+        _collect_events(agent, _make_input(messages=[msg]))
+        self.assertEqual(received, ["Hi there"])
+
 
 class TestLangroidAgentRunLifecycle(unittest.TestCase):
     """Test the run method event lifecycle."""
@@ -162,6 +214,18 @@ class TestLangroidAgentRunLifecycle(unittest.TestCase):
         event_types = [e.type for e in events]
         self.assertEqual(event_types[0], EventType.RUN_STARTED)
         self.assertEqual(event_types[-1], EventType.RUN_FINISHED)
+
+    def test_run_started_declares_protocol_version(self):
+        fake = FakeLangroidAgent(FakeLLMResponse("Hello there!"))
+        agent = LangroidAgent(agent=fake, name="test")
+        events = _collect_events(agent, _make_input(messages=[_make_user_message("Hi")]))
+
+        run_started = events[0]
+        self.assertEqual(run_started.type, EventType.RUN_STARTED)
+        self.assertEqual(run_started.protocol_version, PROTOCOL_VERSION)
+        self.assertEqual(run_started.protocol_version, "1.0")
+        wire = json.loads(EventEncoder().encode(run_started).removeprefix("data: ").strip())
+        self.assertEqual(wire["protocolVersion"], "1.0")
 
     def test_emits_text_message_events(self):
         fake = FakeLangroidAgent(FakeLLMResponse("Hello there!"))
@@ -355,6 +419,115 @@ class TestLangroidAgentPendingToolResult(unittest.TestCase):
         _collect_events(agent, input_data)
 
         self.assertEqual(tracking_agent.last_input, "")
+
+
+class TestLangroidAgentBackendToolDemoCoupling(unittest.TestCase):
+    """Characterization tests pinning the hardcoded Dojo-demo backend tool
+    response generation in ``LangroidAgent.run``.
+
+    The ``run`` method contains tool-name-specific natural-language response
+    synthesis (``get_weather``, ``render_chart``, ``generate_recipe``) that is
+    coupled to the AG-UI Dojo demo tools. These tests guard the current
+    behavior so any future decoupling/generalization can be done safely with a
+    regression net rather than by guesswork. See PR description for the flagged
+    follow-up and the exact agent.py line ranges involved.
+    """
+
+    def _run_backend_tool(self, request, handler_result, **tool_kwargs):
+        tool_response = FakeToolResponse(request=request, **tool_kwargs)
+
+        class BackendAgent:
+            def __init__(self, response, result):
+                self._response = response
+                self._result = result
+                self.message_history = []
+
+            def llm_response(self, msg):
+                return self._response
+
+        agent_impl = BackendAgent(tool_response, handler_result)
+        # Attach the named backend handler dynamically so it is treated as a
+        # backend (not frontend) tool.
+        setattr(agent_impl, request, lambda msg: handler_result)
+
+        agui_agent = LangroidAgent(agent=agent_impl, name="test")
+        input_data = _make_input(
+            messages=[_make_user_message(f"call {request}")],
+            tools=[],  # no frontend tools -> backend path
+        )
+        events = _collect_events(agui_agent, input_data)
+        text = "".join(
+            e.delta for e in events if e.type == EventType.TEXT_MESSAGE_CONTENT
+        )
+        return events, text
+
+    def test_get_weather_produces_demo_specific_response(self):
+        weather = {
+            "location": "NYC",
+            "temperature": 72,
+            "conditions": "sunny",
+            "humidity": 40,
+            "wind_speed": 5,
+            "feels_like": 70,
+        }
+        events, text = self._run_backend_tool(
+            "get_weather", weather, location="NYC"
+        )
+
+        event_types = [e.type for e in events]
+        self.assertIn(EventType.TOOL_CALL_START, event_types)
+        self.assertIn(EventType.TOOL_CALL_RESULT, event_types)
+        # Hardcoded demo template (agent.py get_weather branch).
+        self.assertEqual(
+            text,
+            "The current weather in NYC is 72°F with sunny conditions. "
+            "The wind speed is 5 mph, and the humidity level is at 40%. "
+            "It feels like 70°F.",
+        )
+
+    def test_render_chart_produces_demo_specific_response(self):
+        # Use a ``message`` that differs from the ``chart_type``-derived
+        # fallback (``f"{chart_type} chart has been rendered"``) so this test
+        # proves the ``message`` key takes precedence rather than the code
+        # falling through to the default. With chart_type="pie", the fallback
+        # would be "pie chart has been rendered" -- the assertion below would
+        # fail if message were ignored.
+        chart = {
+            "chart_type": "pie",
+            "status": "completed",
+            "message": "bar chart has been rendered",
+        }
+        events, text = self._run_backend_tool("render_chart", chart)
+
+        event_types = [e.type for e in events]
+        self.assertIn(EventType.TOOL_CALL_RESULT, event_types)
+        # Hardcoded demo template (agent.py render_chart branch): the provided
+        # ``message`` is honored verbatim, not the chart_type fallback.
+        self.assertEqual(text, "bar chart has been rendered.")
+
+    def test_generate_recipe_produces_demo_specific_response(self):
+        # The generate_recipe branch (agent.py ~642-659) reads the recipe from
+        # the *tool args* (tool_args.get("recipe")), not the handler result,
+        # and selects one of four sub-templates based on whether ingredients
+        # and/or instructions are present. This pins the both-present branch.
+        recipe = {
+            "title": "Pancakes",
+            "ingredients": ["flour", "eggs"],
+            "instructions": ["mix", "cook"],
+        }
+        events, text = self._run_backend_tool(
+            "generate_recipe", {"status": "completed"}, recipe=recipe
+        )
+
+        event_types = [e.type for e in events]
+        self.assertIn(EventType.TOOL_CALL_RESULT, event_types)
+        # Hardcoded demo template (agent.py generate_recipe branch): title is
+        # lowercased and the ingredients-and-instructions sub-template is used.
+        self.assertEqual(
+            text,
+            "I created a complete pancakes recipe based on the existing "
+            "ingredients and instructions.",
+        )
 
 
 if __name__ == "__main__":

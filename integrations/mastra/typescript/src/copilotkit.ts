@@ -1,13 +1,31 @@
-import { AbstractAgent } from "@ag-ui/client";
 import {
+  AgentsConfig,
+  CopilotCorsConfig,
   CopilotRuntime,
-  copilotRuntimeNodeHttpEndpoint,
-  CopilotServiceAdapter,
-  ExperimentalEmptyAdapter,
-} from "@copilotkit/runtime";
-import { RequestContext } from "@mastra/core/request-context";
-import { registerApiRoute } from "@mastra/core/server";
-import { MastraAgent } from "./mastra";
+  CopilotRuntimeOptions,
+  createCopilotRuntimeHandler,
+} from "@copilotkit/runtime/v2";
+import {
+  MASTRA_RESOURCE_ID_KEY,
+  RequestContext,
+} from "@mastra/core/request-context";
+import { ContextWithMastra, registerApiRoute } from "@mastra/core/server";
+import {
+  MastraAgent,
+  type MastraSubagentToolResults,
+  type MastraSubagentVisibility,
+  MastraTracingOptions,
+} from "./mastra";
+
+/**
+ * `Omit` that distributes over each member of a union, so a discriminated union
+ * (e.g. `CopilotRuntimeOptions`) keeps its discriminant correlation. Plain
+ * `Omit<A | B, K>` collapses to `Omit<A & B, K>` because `keyof (A | B)` is only
+ * the shared keys, which destroys the union.
+ */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
+  ? Omit<T, K>
+  : never;
 
 /**
  * Registers a CopilotKit endpoint that exposes Mastra agents through the AG-UI protocol.
@@ -20,30 +38,55 @@ import { MastraAgent } from "./mastra";
  * });
  * ```
  */
-export function registerCopilotKit<
-  T extends Record<string, any> | unknown = unknown,
->({
+export function registerCopilotKit({
   path,
   resourceId,
-  serviceAdapter = new ExperimentalEmptyAdapter(),
-  agents,
   setContext,
+  agents,
+  cors,
+  tracingOptions,
+  subagentVisibility,
+  subagentToolResults,
+  ...runtimeOptions
 }: {
   path: string;
   resourceId: string;
-  serviceAdapter?: CopilotServiceAdapter;
-  agents?: Record<string, AbstractAgent>;
+  /**
+   * Mastra tracing options forwarded to each agent run (default-agent path
+   * only; ignored when `agents` is supplied since those are pre-constructed).
+   * See MastraAgentConfig.tracingOptions.
+   */
+  tracingOptions?: MastraTracingOptions;
+  /**
+   * How delegated sub-agents reach the stream (default-agent path only).
+   * See MastraAgentConfig.subagentVisibility.
+   */
+  subagentVisibility?: MastraSubagentVisibility;
+  /**
+   * What attributed sub-agents' tool results carry (default-agent path only).
+   * See MastraAgentConfig.subagentToolResults.
+   */
+  subagentToolResults?: MastraSubagentToolResults;
+  /**
+   * Hook to populate the request context before agents run. It runs inside the
+   * route handler, i.e. *after* any Mastra server middleware, so the
+   * `requestContext` it receives already holds whatever keys that middleware
+   * set. Be careful not to clobber those keys (e.g. `MASTRA_RESOURCE_ID_KEY`)
+   * unless that is the intent.
+   */
   setContext?: (
-    c: any,
-    requestContext: RequestContext<T>,
+    c: ContextWithMastra,
+    requestContext: RequestContext,
   ) => void | Promise<void>;
-}) {
+  cors?: boolean | CopilotCorsConfig;
+} & DistributiveOmit<CopilotRuntimeOptions, "agents"> & {
+    agents?: AgentsConfig;
+  }) {
   return registerApiRoute(path, {
     method: `ALL`,
     handler: async (c) => {
       const mastra = c.get("mastra");
-
-      const requestContext = new RequestContext<T>();
+      const requestContext = c.get("requestContext");
 
       if (setContext) {
         await setContext(c, requestContext);
@@ -52,22 +95,41 @@ export function registerCopilotKit<
       const aguiAgents =
         agents ||
         MastraAgent.getLocalAgents({
-          resourceId,
+          resourceId:
+            requestContext.get<
+              typeof MASTRA_RESOURCE_ID_KEY,
+              string | undefined
+            >(MASTRA_RESOURCE_ID_KEY) ?? resourceId,
           mastra,
-          requestContext: requestContext as RequestContext,
+          requestContext,
+          tracingOptions,
+          subagentVisibility,
+          subagentToolResults,
         });
 
       const runtime = new CopilotRuntime({
-        agents: aguiAgents as any,
+        ...runtimeOptions,
+        agents: aguiAgents,
       });
 
-      const handler = copilotRuntimeNodeHttpEndpoint({
-        endpoint: path,
+      const handler = createCopilotRuntimeHandler({
         runtime,
-        serviceAdapter,
+        basePath: path,
+        cors,
+        mode: "single-route",
       });
 
-      return handler(c.req.raw);
+      // CopilotKit forwards `authorization` and `x-*` headers onto the agent
+      // (`configureAgentForRequest` → `extractForwardableHeaders`), and
+      // `@ag-ui/mastra` then passes the agent's headers as
+      // `modelSettings.headers` into the model call. That would forward our
+      // Mastra Authorization to our AI provider and clobber the provider's real
+      // Authorization header. Mastra has already authenticated this request by
+      // now, so drop the header before the runtime sees it.
+      const headers = new Headers(c.req.raw.headers);
+      headers.delete("authorization");
+
+      return handler(new Request(c.req.raw, { headers }));
     },
   });
 }

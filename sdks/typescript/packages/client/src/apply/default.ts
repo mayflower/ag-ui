@@ -1,3 +1,4 @@
+import { authoritativeActivityTypes } from "../activity-history";
 import type { AbstractAgent } from "@/agent/agent";
 import {
   type AgentStateMutation,
@@ -11,10 +12,11 @@ import {
   type AssistantMessage,
   type BaseEvent,
   type CustomEvent,
-  DeveloperMessage,
   EventType,
   type Message,
   type MessagesSnapshotEvent,
+  type Metadata,
+  mergeMetadata,
   type RawEvent,
   type ReasoningEncryptedValueEvent,
   type ReasoningEndEvent,
@@ -31,21 +33,23 @@ import {
   type StateSnapshotEvent,
   type StepFinishedEvent,
   type StepStartedEvent,
-  SystemMessage,
+  type SubagentErrorEvent,
+  type SubagentFinishedEvent,
+  type SubagentStartedEvent,
   type TextMessageContentEvent,
   type TextMessageEndEvent,
   type TextMessageStartEvent,
   type ToolCallArgsEvent,
   type ToolCallEndEvent,
   type ToolCallResultEvent,
+  type ToolCall,
   type ToolCallStartEvent,
   type ToolMessage,
-  UserMessage,
 } from "@ag-ui/core";
 import jsonpatch from "fast-json-patch";
 import { EMPTY, of } from "rxjs";
 import type { Observable } from "rxjs";
-import { concatMap, defaultIfEmpty, mergeAll, mergeMap } from "rxjs/operators";
+import { concatMap, defaultIfEmpty, mergeAll } from "rxjs/operators";
 import untruncateJson from "untruncate-json";
 import { structuredClone_ } from "../utils";
 import { type DebugLoggerInput, resolveDebugLogger } from "@/debug-logger";
@@ -91,6 +95,305 @@ function resolveOrCreateAssistantMessage(
   return created;
 }
 
+/**
+ * Folds an event's metadata into the thing that event builds, key by key, with
+ * the last write winning.
+ *
+ * The target is a message, or a tool call for the TOOL_CALL_* events — a tool
+ * call is not a message, and several can share one parent assistant message, so
+ * folding theirs into that parent would make the result depend on their relative
+ * order. Metadata on a run-, step- or state-level event belongs to that event
+ * and never reaches either.
+ *
+ * Values are cloned so the event payload can't alias into the message array and
+ * be mutated later through the caller's copy of the event.
+ *
+ * Returns whether anything changed, so callers only emit a mutation when it did.
+ *
+ * Known limitation, deliberately not fixed here. Handlers resolve their target
+ * before running subscribers, so a subscriber that returns a replacement
+ * `messages` array leaves that reference pointing into the discarded one and
+ * this write is lost. Review has raised it repeatedly; it is not fixed because
+ * the cure is worse than the disease. Re-resolving by id costs an O(n) scan on
+ * TEXT_MESSAGE_CONTENT, which fires per streamed token, to fix a case that needs
+ * a subscriber replacing the array from that specific hook — and the same
+ * staleness already loses the content append on `main`, so it is a pre-existing
+ * reducer issue rather than a metadata one. Fixing it belongs in its own change,
+ * conditional on `mutation.messages !== undefined` so the hot path pays nothing.
+ */
+function applyEventMetadata(
+  target: { metadata?: Metadata } | undefined,
+  event: BaseEvent,
+): boolean {
+  if (!target || event.metadata === undefined) {
+    return false;
+  }
+  target.metadata = mergeMetadata(target.metadata, structuredClone_(event.metadata));
+  return true;
+}
+
+// The role of a history entry, or undefined for a null or non-object entry.
+const roleOf = (message: unknown): unknown =>
+  typeof message === "object" && message !== null
+    ? (message as { role?: unknown }).role
+    : undefined;
+
+// The call ids an assistant message issues. Ignores a non-array `toolCalls`
+// and entries that are not objects with a string `id`, which unverified input
+// can carry.
+function issuedCallIds(message: unknown): string[] {
+  if (roleOf(message) !== "assistant") return [];
+  const toolCalls = (message as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return [];
+  const ids: string[] = [];
+  for (const toolCall of toolCalls) {
+    if (typeof toolCall !== "object" || toolCall === null) continue;
+    const id = (toolCall as { id?: unknown }).id;
+    if (typeof id === "string") ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * Move each tool result that has drifted away from its call to sit right
+ * after the assistant message that issued it — usually back to an earlier
+ * call, and forward only when exactly one call in the whole history has its
+ * id. Runs when a MESSAGES_SNAPSHOT is applied, and on the copy of the
+ * history `prepareRunAgentInput` sends as a run's input.
+ *
+ * Providers require an assistant tool_call to be immediately followed by its
+ * result, and this history is sent back as the next run's input. The
+ * MESSAGES_SNAPSHOT merge matches by id, and ids are generally not stable
+ * between streamed events and the snapshot: a streamed result the snapshot
+ * re-ids is dropped from its place and the snapshot's copy is appended, leaving
+ * `assistant(tool_call) -> assistant(text) -> tool`. A history already stored
+ * in that order is never reordered by the merge either; this pass repairs it
+ * the next time a MESSAGES_SNAPSHOT arrives, and not before.
+ *
+ * Semantics, by list position (index) only — never object identity or message
+ * id. The merge can put one message object in the list twice (two local
+ * messages sharing an id map to the same snapshot object); those are two
+ * independent slots. Nothing is dropped, deduplicated or added, and only
+ * tool-role messages change position. So a call message the merge duplicated
+ * is two calls, and the copy its result does not pair with stays unanswered.
+ *
+ * - Null and non-object entries are transparent: they are passed through in
+ *   place and otherwise ignored, so they never separate a call from its result.
+ *   This tolerance is for direct callers: the MESSAGES_SNAPSHOT merge reads a
+ *   field of every entry before calling this, and `prepareRunAgentInput`
+ *   reads one before a run, so a null entry fails there first.
+ * - The anchor of a position is the last entry before it that is an object
+ *   whose role is not `tool`, `activity` or `reasoning`. `activity` never goes
+ *   to the backend — `prepareRunAgentInput` strips it from RunAgentInput — so
+ *   it does not separate a result from its call. Neither does `reasoning`:
+ *   reasoning stored between a call and its result is the next step's. A
+ *   multi-step Mastra turn whose calls share one assistant message leaves
+ *   `assistant(c1, c2), tool(c1), reasoning, tool(c2)`, and moving the result
+ *   in front of the reasoning leaves it trailing, so Mastra drops it.
+ *   Anything else separates them.
+ * - At an assistant message whose `toolCalls` is an array, each entry that is
+ *   a non-null object with a string `id` opens a call slot for that id,
+ *   recording the message's index as its issuer. Other entries and a
+ *   non-array `toolCalls` are ignored.
+ * - Slots are matched by call id alone. `subagentRunId` is ignored: on a
+ *   result it names the run that executed the tool, which may differ from
+ *   the run that issued the call. Known limitation: a parent call and a
+ *   subagent call that reuse one id are indistinguishable, so their drifted
+ *   results can be swapped between them.
+ * - First pass, left to right: a tool message with a string `toolCallId` that
+ *   finds an unanswered slot for its id issued at its anchor is in place. It
+ *   answers that slot and stays. Otherwise, if an earlier slot for the id is
+ *   unanswered, the result is detached; detached results do not answer slots
+ *   in this pass. A result with no earlier slot for its id at all is early.
+ *   Any other result — every earlier slot for its id already answered — stays
+ *   where it is, as does a result without a string id.
+ * - Backward, per id: the detached results, from the last back to the first,
+ *   each answer the newest still-unanswered slot issued before it and move to
+ *   that slot's issuer. One that finds none stays.
+ *
+ *   Newest-back keeps each turn's result with its turn when several detached
+ *   results share an id that providers reuse every turn (`call_0`): after a
+ *   reload re-ids every result, `u1 a1 a1t u2 a2 a2t t1 t2` becomes
+ *   `u1 a1 t1 a1t u2 a2 t2 a2t`. It also means a lone detached result goes to
+ *   the nearest open call, so a result is not pulled back past a later call
+ *   with its id to an earlier one that was abandoned. It cannot tell a
+ *   duplicate result from a late answer, though: a second result for a call
+ *   that is already answered moves back to an older unanswered call with the
+ *   same id, across any user turns in between.
+ * - Forward, only for a unique id: an early result moves forward only when
+ *   its id is on exactly one call slot in the whole list (counting every
+ *   entry of every assistant `toolCalls`, aliased copies included), and that
+ *   slot is still unanswered after the first pass and the backward pass. Then
+ *   the first early result for the id, left to right, answers it and moves
+ *   to its issuer; any other early results for the id stay. This repairs a
+ *   result whose call was re-issued after it — typically the snapshot re-ids
+ *   the assistant message but keeps the result's id, and the merge leaves
+ *   `t a(tool_call)`. When the id is reused (providers issue `call_0` every
+ *   turn), the call an early result belongs to is a guess: it may be a
+ *   later turn's human-in-the-loop call still waiting on the user, and
+ *   answering it with an old result would be wrong. So with a reused id no
+ *   result moves forward, and early results stay where they are.
+ * - Output keeps the original order without the moved results. Each issuer's
+ *   moved results, forward and backward alike, follow it in their original
+ *   order, after the tool, activity, reasoning, null and non-object entries
+ *   directly behind it and before the next entry that is none of those (or at
+ *   the end) — but in front of any reasoning among the activity, reasoning,
+ *   null and non-object entries at that point. Reasoning belongs to the
+ *   message after it, so a moved result never lands between a reasoning
+ *   message and its owner: `u a(c) r x t(c)` becomes `u a t r x`.
+ *
+ * Linear in the length of the list, apart from sorting the results that move
+ * and one case: when a single assistant message repeats a call id k times,
+ * each result for that id behind it scans those k slots.
+ * Returns the same array when nothing moves.
+ */
+export function keepToolResultsWithCalls(messages: Message[]): Message[] {
+  // Call slots per call id, as issuer indices in the order opened, and
+  // whether each is answered.
+  const slots = new Map<string, { issuer: number; answered: boolean }[]>();
+  // How many of each id's slots are still unanswered.
+  const unanswered = new Map<string, number>();
+  const answer = (id: string, slot: { issuer: number; answered: boolean }) => {
+    slot.answered = true;
+    unanswered.set(id, unanswered.get(id)! - 1);
+  };
+  // Detached result indices per call id, in original order.
+  const detached = new Map<string, number[]>();
+  // Result indices per call id, in original order, that no earlier slot for
+  // their id exists for: the only results that may move forward, and only
+  // when their id ends up on exactly one slot.
+  const early = new Map<string, number[]>();
+  const append = <K, T>(map: Map<K, T[]>, key: K, value: T) => {
+    const list = map.get(key);
+    if (list) list.push(value);
+    else map.set(key, [value]);
+  };
+  let anchor = -1;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (typeof message !== "object" || message === null) continue;
+    const role = roleOf(message);
+    if (role === "tool") {
+      const id = (message as ToolMessage).toolCallId;
+      if (typeof id !== "string") continue;
+      const idSlots = slots.get(id);
+      if (!idSlots) {
+        append(early, id, index);
+        continue;
+      }
+      // Slots open in list order and the anchor is the newest issuer, so the
+      // anchor's slots sit at the tail: scan only those.
+      let inPlace: { issuer: number; answered: boolean } | undefined;
+      for (let s = idSlots.length - 1; s >= 0 && idSlots[s].issuer === anchor; s--) {
+        if (!idSlots[s].answered) inPlace = idSlots[s];
+      }
+      if (inPlace) {
+        answer(id, inPlace);
+        continue;
+      }
+      // Every slot for this id issued at the anchor is answered, so a
+      // detached result can only take a slot for its id issued before the
+      // anchor, which no later in-place result can take. Deciding the
+      // in-place results first is therefore safe.
+      if (unanswered.get(id)! > 0) append(detached, id, index);
+    } else if (role !== "activity" && role !== "reasoning") {
+      anchor = index;
+      for (const id of issuedCallIds(message)) {
+        append(slots, id, { issuer: index, answered: false });
+        unanswered.set(id, (unanswered.get(id) ?? 0) + 1);
+      }
+    }
+  }
+
+  // Moved result indices per issuer index.
+  const owedTo = new Map<number, number[]>();
+  const moved: boolean[] = [];
+  const move = (id: string, index: number, slot: { issuer: number; answered: boolean }) => {
+    answer(id, slot);
+    append(owedTo, slot.issuer, index);
+    moved[index] = true;
+  };
+  // Backward: each id's detached results, newest first, take the newest
+  // unanswered slot for their id issued before them. Each result needs a slot
+  // issued before it and they go newest first, so that slot only ever moves
+  // left: one cursor per id keeps the pass linear even when every turn reuses
+  // the same id.
+  for (const [id, results] of detached) {
+    const idSlots = slots.get(id)!;
+    let s = idSlots.length - 1;
+    for (let r = results.length - 1; r >= 0; r--) {
+      const index = results[r];
+      while (s >= 0 && (idSlots[s].answered || idSlots[s].issuer >= index)) s--;
+      if (s < 0) break;
+      move(id, index, idSlots[s]);
+    }
+  }
+  // Forward: only when the id is on exactly one call slot in the whole list.
+  // With a reused id, which later call an early result belongs to is a guess,
+  // and a wrong guess answers a call that may still be pending (a
+  // human-in-the-loop call_0 waiting on the user), so those results stay.
+  // The unique slot is issued after every early result for its id (none had
+  // an earlier slot), and if it is still open the first of them takes it.
+  for (const [id, results] of early) {
+    const idSlots = slots.get(id);
+    if (idSlots?.length !== 1 || idSlots[0].answered) continue;
+    move(id, results[0], idSlots[0]);
+  }
+  if (owedTo.size === 0) return messages;
+  // Ids are matched one at a time, and forward and backward moves can share
+  // an issuer; restore each issuer's results to their original order.
+  for (const owed of owedTo.values()) owed.sort((a, b) => a - b);
+
+  const repaired: Message[] = [];
+  let owed: number[] | undefined;
+  const flush = () => {
+    if (owed) {
+      // Converters give a reasoning message to the message after it, so the
+      // owed results go in front of any reasoning among the entries at the
+      // tail that do not separate, never between a reasoning message and its
+      // owner. Activity is stripped before a run, so it is looked past too.
+      let at = repaired.length;
+      for (let tail = repaired.length - 1; tail >= 0; tail--) {
+        const entry = repaired[tail];
+        const role = roleOf(entry);
+        if (
+          typeof entry === "object" &&
+          entry !== null &&
+          role !== "activity" &&
+          role !== "reasoning"
+        )
+          break;
+        if (role === "reasoning") at = tail;
+      }
+      // Pushed one by one: spreading a large batch into splice() exceeds the
+      // engine's argument limit (RangeError: Maximum call stack size exceeded).
+      const tail = repaired.splice(at);
+      for (const index of owed) repaired.push(messages[index]);
+      for (const entry of tail) repaired.push(entry);
+    }
+    owed = undefined;
+  };
+  for (let index = 0; index < messages.length; index++) {
+    if (moved[index]) continue;
+    const message = messages[index];
+    const role = roleOf(message);
+    const separates =
+      typeof message === "object" &&
+      message !== null &&
+      role !== "tool" &&
+      role !== "activity" &&
+      role !== "reasoning";
+    if (separates) flush();
+    repaired.push(message);
+    // Only a separating entry can be an issuer, and it flushed the previous
+    // issuer's results just above, so nothing owed is overwritten.
+    owed = owedTo.get(index) ?? owed;
+  }
+  // Results owed to the last issuer, which no later separating entry flushed.
+  flush();
+  return repaired;
+}
+
 export const defaultApplyEvents = (
   input: RunAgentInput,
   events$: Observable<BaseEvent>,
@@ -102,6 +405,19 @@ export const defaultApplyEvents = (
   let messages = structuredClone_(agent.messages);
   let state = structuredClone_(input.state);
   let currentMutation: AgentStateMutation = {};
+
+  // The tool calls this run has started and answered so far. RUN_FINISHED
+  // reads them when the success outcome names no `pendingToolCallIds`: the
+  // specification lets a consumer derive the pending list from the stream —
+  // every call the run started that got no TOOL_CALL_RESULT — and a producer
+  // that names the list is trusted over the tally.
+  let runToolCallIds: string[] = [];
+  let answeredToolCallIds = new Set<string>();
+  const pendingToolCallIdsOf = (e: RunFinishedEvent): string[] => {
+    const named = e.outcome?.type === "success" ? e.outcome.pendingToolCallIds : undefined;
+    if (named !== undefined && named.length > 0) return [...named];
+    return runToolCallIds.filter((id) => !answeredToolCallIds.has(id));
+  };
 
   const applyMutation = (mutation: AgentStateMutation) => {
     if (mutation.messages !== undefined) {
@@ -168,13 +484,34 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { messageId, role = "assistant", name } = event as TextMessageStartEvent;
+            const {
+              messageId,
+              role = "assistant",
+              name,
+              subagentRunId,
+            } = event as TextMessageStartEvent;
 
             // Check if a message with this ID already exists (e.g., created by TOOL_CALL_START
             // with the same parentMessageId)
             const existingMessage = messages.find((m) => m.id === messageId);
 
-            if (!existingMessage) {
+            if (existingMessage?.role === "activity") {
+              // Message ids are unique across the conversation, so an activity message under
+              // this id means the producer reused it. Streaming text into it would overwrite
+              // its structured content with a string. Leave it alone and drop the text — and
+              // with it the event's metadata, which describes a text message that never exists.
+              console.warn(
+                `TEXT_MESSAGE_START: Message '${messageId}' is an activity message — ` +
+                  `message ids must be unique across activity and text messages`,
+              );
+              return emitUpdates();
+            }
+
+            // Annotated: the guard above narrows `existingMessage` to the non-activity
+            // members, while the message created below is a full `Message`.
+            let targetMessage: Message | undefined = existingMessage;
+
+            if (!targetMessage) {
               // Create a new message using properties from the event
               // Text messages can be developer, system, assistant, or user (not tool)
               const newMessage: Message = {
@@ -182,14 +519,20 @@ export const defaultApplyEvents = (
                 role: role,
                 content: "",
                 ...(name !== undefined && { name }),
+                ...(subagentRunId != null && { subagentRunId }),
               };
 
               // Add the new message to the messages array
               messages.push(newMessage);
-              applyMutation({ messages });
+              targetMessage = newMessage;
             }
             // If message already exists, we don't need to create a new one
             // The TEXT_MESSAGE_CONTENT events will update the existing message's content
+
+            const metadataChanged = applyEventMetadata(targetMessage, event);
+            if (!existingMessage || metadataChanged) {
+              applyMutation({ messages });
+            }
           }
           return emitUpdates();
         }
@@ -201,6 +544,15 @@ export const defaultApplyEvents = (
           const targetMessage = messages.find((m) => m.id === messageId);
           if (!targetMessage) {
             console.warn(`TEXT_MESSAGE_CONTENT: No message found with ID '${messageId}'`);
+            return emitUpdates();
+          }
+          if (targetMessage.role === "activity") {
+            // Appending here would replace the activity message's structured content with a
+            // string, leaving it no longer a valid ActivityMessage.
+            console.warn(
+              `TEXT_MESSAGE_CONTENT: Message '${messageId}' is an activity message — ` +
+                `message ids must be unique across activity and text messages`,
+            );
             return emitUpdates();
           }
 
@@ -226,6 +578,7 @@ export const defaultApplyEvents = (
             const existingContent =
               typeof targetMessage.content === "string" ? targetMessage.content : "";
             targetMessage.content = `${existingContent}${delta}`;
+            applyEventMetadata(targetMessage, event);
             applyMutation({ messages });
           }
 
@@ -239,6 +592,15 @@ export const defaultApplyEvents = (
           const targetMessage = messages.find((m) => m.id === messageId);
           if (!targetMessage) {
             console.warn(`TEXT_MESSAGE_END: No message found with ID '${messageId}'`);
+            return emitUpdates();
+          }
+          if (targetMessage.role === "activity") {
+            // The matching TEXT_MESSAGE_START was dropped for the same reason, so there is no
+            // text message to finish — don't announce the activity message as a new one.
+            console.warn(
+              `TEXT_MESSAGE_END: Message '${messageId}' is an activity message — ` +
+                `message ids must be unique across activity and text messages`,
+            );
             return emitUpdates();
           }
 
@@ -259,9 +621,16 @@ export const defaultApplyEvents = (
           );
           applyMutation(mutation);
 
+          // Merge before onNewMessage so subscribers see the completed message.
+          // An end event is where late-known values — token usage, finish
+          // reason — typically arrive.
+          if (mutation.stopPropagation !== true && applyEventMetadata(targetMessage, event)) {
+            applyMutation({ messages });
+          }
+
           await Promise.all(
             subscribers.map((subscriber) => {
-              subscriber.onNewMessage?.({
+              return subscriber.onNewMessage?.({
                 message: targetMessage,
                 messages,
                 state,
@@ -291,25 +660,72 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { toolCallId, toolCallName, parentMessageId } = event as ToolCallStartEvent;
+            const { toolCallId, toolCallName, parentMessageId, subagentRunId } =
+              event as ToolCallStartEvent;
+            if (!runToolCallIds.includes(toolCallId)) runToolCallIds.push(toolCallId);
 
+            // Applying a start event must be idempotent. The same start can
+            // reach this reducer twice — a tool call already carried in
+            // `agent.messages` from an earlier run and then replayed by the
+            // backend (the HITL path does this when the run re-syncs after
+            // `respond()`), or one stream re-delivered over two transports.
+            // Appending unconditionally would leave the assistant message
+            // holding the id twice, and the second copy stays empty because
+            // TOOL_CALL_ARGS resolves to the first match. That malformed
+            // message is then what travels back to the provider on the next
+            // turn. Resolve the existing entry the same way TOOL_CALL_ARGS
+            // does, and do it before resolveOrCreateAssistantMessage so a
+            // replay can't append a stray empty assistant message either.
+            const ownerMessage = messages.find((m) =>
+              (m as AssistantMessage).toolCalls?.some((tc) => tc.id === toolCallId),
+            ) as AssistantMessage | undefined;
+            const existingToolCall = ownerMessage?.toolCalls?.find((tc) => tc.id === toolCallId);
+
+            if (existingToolCall) {
+              // Update the existing entry instead of pushing a second one, and
+              // leave `arguments` untouched — a start event carries none, so
+              // the copy already in state holds the only streamed args.
+              const renamed = existingToolCall.function.name !== toolCallName;
+              if (renamed) {
+                console.warn(
+                  `TOOL_CALL_START: tool call '${toolCallId}' already exists with name ` +
+                    `'${existingToolCall.function.name}' — updating it to '${toolCallName}'`,
+                );
+                existingToolCall.function.name = toolCallName;
+              }
+
+              if (applyEventMetadata(existingToolCall, event) || renamed) {
+                applyMutation({ messages });
+              }
+
+              return emitUpdates();
+            }
+
+            const preexistingIds = new Set(messages.map((m) => m.id));
             const targetMessage = resolveOrCreateAssistantMessage(
               messages,
               parentMessageId,
               toolCallId,
             );
+            const wasCreated = !preexistingIds.has(targetMessage.id);
+            if (wasCreated && subagentRunId != null && targetMessage.subagentRunId === undefined) {
+              targetMessage.subagentRunId = subagentRunId;
+            }
 
             targetMessage.toolCalls ??= [];
 
             // Add the new tool call
-            targetMessage.toolCalls.push({
+            const newToolCall: ToolCall = {
               id: toolCallId,
               type: "function",
               function: {
                 name: toolCallName,
                 arguments: "",
               },
-            });
+            };
+            targetMessage.toolCalls.push(newToolCall);
+
+            applyEventMetadata(newToolCall, event);
 
             applyMutation({ messages });
           }
@@ -350,7 +766,10 @@ export const defaultApplyEvents = (
               try {
                 // Parse from toolCallBuffer only (before current delta is applied)
                 partialToolCallArgs = untruncateJson(toolCallBuffer);
-              } catch (error) {}
+              } catch (_error) {
+                // Streaming args are mid-flight and frequently unparseable;
+                // fall through with the last good partial object.
+              }
 
               return subscriber.onToolCallArgsEvent?.({
                 event: event as ToolCallArgsEvent,
@@ -369,6 +788,7 @@ export const defaultApplyEvents = (
           if (mutation.stopPropagation !== true) {
             // Append the arguments to the correct tool call by ID
             targetToolCall.function.arguments += delta;
+            applyEventMetadata(targetToolCall, event);
             applyMutation({ messages });
           }
 
@@ -407,7 +827,10 @@ export const defaultApplyEvents = (
               let toolCallArgs = {};
               try {
                 toolCallArgs = JSON.parse(toolCallArgsString);
-              } catch (error) {}
+              } catch (_error) {
+                // A malformed final payload must not abort the run; downstream
+                // sees the empty object.
+              }
               return subscriber.onToolCallEndEvent?.({
                 event: event as ToolCallEndEvent,
                 messages,
@@ -421,9 +844,15 @@ export const defaultApplyEvents = (
           );
           applyMutation(mutation);
 
+          // Merge before onNewToolCall, for the same reason as TEXT_MESSAGE_END:
+          // an end event carries the values only known once the call is closed.
+          if (mutation.stopPropagation !== true && applyEventMetadata(targetToolCall, event)) {
+            applyMutation({ messages });
+          }
+
           await Promise.all(
             subscribers.map((subscriber) => {
-              subscriber.onNewToolCall?.({
+              return subscriber.onNewToolCall?.({
                 toolCall: targetToolCall,
                 messages,
                 state,
@@ -454,28 +883,107 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { messageId, toolCallId, content, role } = event as ToolCallResultEvent;
+            const { messageId, toolCallId, content, role, subagentRunId } =
+              event as ToolCallResultEvent;
+            answeredToolCallIds.add(toolCallId);
 
+            const existingIndex = messages.findIndex(
+              (message) =>
+                message.id === messageId &&
+                message.role === "tool" &&
+                message.toolCallId === toolCallId,
+            );
             const toolMessage: ToolMessage = {
+              ...(existingIndex !== -1 ? messages[existingIndex] : {}),
               id: messageId,
               toolCallId,
               role: role || "tool",
               content: content,
+              ...(subagentRunId != null && { subagentRunId }),
             };
 
-            messages.push(toolMessage);
+            // A correction reassigns ownership, including back to the parent
+            // when its tag is absent, just as the verifier records it.
+            if (subagentRunId == null) delete toolMessage.subagentRunId;
 
-            await Promise.all(
-              subscribers.map((subscriber) => {
-                subscriber.onNewMessage?.({
-                  message: toolMessage,
-                  messages,
-                  state,
-                  agent,
-                  input,
-                });
-              }),
-            );
+            applyEventMetadata(toolMessage, event);
+
+            // A resumed run may correct a result already present in history.
+            // Keep its position and metadata; a repeated message ID is an update.
+            if (existingIndex !== -1) {
+              messages[existingIndex] = toolMessage;
+            } else {
+              // Place the tool result immediately after the assistant message that
+              // issued the matching tool call — not at the end. A result event can
+              // arrive after a trailing assistant text message (e.g. a
+              // chat -> tool -> chat loop streams the follow-up text before the
+              // result is recorded). Appending would leave the history as
+              // assistant(tool_call) -> text -> tool, which violates the provider
+              // contract that an assistant tool_call is immediately followed by its
+              // tool result and surfaces downstream as a 400.
+              //
+              // Providers reuse ids such as `call_0` every turn, so several
+              // assistant messages can hold the call id. Holders and tool
+              // messages are matched by call id alone, as in
+              // keepToolResultsWithCalls: a result's subagentRunId names the run
+              // that executed it, which may differ from the run that issued the
+              // call. The owner is the newest holder that has no tool message
+              // with that id between it and the next holder (or the end); if
+              // every holder has one, the newest holder. The result goes after
+              // the owner and after every tool, activity or non-object entry
+              // directly behind it — any call's results, not only this one's, so
+              // parallel results keep their order, and activity, which never
+              // goes to the backend. keepToolResultsWithCalls treats a result
+              // there as in place while the owner has an unanswered call with
+              // that id, so a later snapshot leaves it there. Fall back to
+              // append when no assistant message holds the id.
+              let ownerIndex = -1;
+              let newestHolder = -1;
+              let answered = false;
+              for (let index = messages.length - 1; index >= 0; index--) {
+                const message = messages[index];
+                if (
+                  roleOf(message) === "tool" &&
+                  (message as ToolMessage).toolCallId === toolCallId
+                ) {
+                  answered = true;
+                } else if (issuedCallIds(message).includes(toolCallId)) {
+                  if (newestHolder === -1) newestHolder = index;
+                  if (!answered) {
+                    ownerIndex = index;
+                    break;
+                  }
+                  answered = false;
+                }
+              }
+              if (ownerIndex === -1) ownerIndex = newestHolder;
+              if (ownerIndex === -1) {
+                messages.push(toolMessage);
+              } else {
+                let insertAt = ownerIndex + 1;
+                while (
+                  insertAt < messages.length &&
+                  (typeof messages[insertAt] !== "object" ||
+                    roleOf(messages[insertAt]) === "tool" ||
+                    roleOf(messages[insertAt]) === "activity")
+                ) {
+                  insertAt++;
+                }
+                messages.splice(insertAt, 0, toolMessage);
+              }
+
+              await Promise.all(
+                subscribers.map((subscriber) => {
+                  return subscriber.onNewMessage?.({
+                    message: toolMessage,
+                    messages,
+                    state,
+                    agent,
+                    input,
+                  });
+                }),
+              );
+            }
 
             applyMutation({ messages });
           }
@@ -565,29 +1073,72 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { messages: newMessages } = event as MessagesSnapshotEvent;
+            const { messages: rawNewMessages } = event as MessagesSnapshotEvent;
+            // A runtime null tag reads as absent — it must not persist into state
+            // and ride the next run's serialized input (the schemas forbid null;
+            // this reducer also runs on unverified inputs).
+            const newMessages = rawNewMessages.map((m) => {
+              if ((m as { subagentRunId?: string | null }).subagentRunId !== null) return m;
+              // Spread + delete: Message is a union, so rest-destructuring is a
+              // tsc error (TS2700).
+              const copy = { ...m } as typeof m & { subagentRunId?: string | null };
+              delete copy.subagentRunId;
+              return copy as typeof m;
+            });
 
-            // Edit-based merge: update existing messages with snapshot data while
-            // preserving activity and reasoning messages (which the backend
-            // doesn't include in the snapshot).
+            // Update existing messages in place and append new snapshot messages,
+            // preserving client-only messages the backend leaves out.
             const snapshotMap = new Map(newMessages.map((m) => [m.id, m]));
 
-            // Step 1 + 2: Keep activity/reasoning messages as-is, keep messages
-            // present in the snapshot (replaced with snapshot version), drop
-            // everything else.
-            const isClientOnlyRole = (role: string) =>
-              role === "activity" || role === "reasoning";
-            messages = messages
-              .filter((m) => isClientOnlyRole(m.role) || snapshotMap.has(m.id))
-              .map((m) => (isClientOnlyRole(m.role) ? m : snapshotMap.get(m.id)!));
+            // `activity` messages are only sometimes client-only. They never
+            // travel back to the backend — `prepareRunAgentInput` strips them
+            // from RunAgentInput — so a backend that does not track them cannot
+            // put them in the snapshot, and the local copies must be preserved.
+            // But a backend that does track them re-delivers the whole set it
+            // owns. Since a MESSAGES_SNAPSHOT is a snapshot of every message,
+            // once it carries any activity the backend is declaring the complete
+            // activity set, and one it leaves out has been removed — preserving
+            // it would make the local copy undeletable. So when the snapshot
+            // itself carries activity, treat it as the source of truth for
+            // activity messages and apply the normal replace semantics.
+            //
+            // `reasoning` messages are only sometimes client-only. Most backends
+            // never include reasoning in the snapshot (it exists purely as
+            // streamed REASONING_* events), so dropping local reasoning here
+            // would lose it. But a backend that round-trips reasoning (e.g.
+            // LangGraph re-deriving it from checkpointed content blocks)
+            // re-delivers the streamed reasoning under its own canonical id —
+            // message ids are generally NOT stable between streamed events and
+            // the snapshot. Preserving the streamed copy next to the snapshot
+            // copy would render the same reasoning twice. So when the snapshot
+            // itself carries reasoning, treat it as the source of truth for
+            // reasoning messages too and apply the normal replace semantics.
+            // Explicit null replaces all types, including an empty activity set.
+            // Arrays replace only their types; absent declarations use the rule above.
+            // Invalid declarations own no types. Matching IDs always update.
+            const ownedActivityTypes = authoritativeActivityTypes(event as MessagesSnapshotEvent);
+            const snapshotHasActivity = newMessages.some((m) => m.role === "activity");
+            const snapshotHasReasoning = newMessages.some((m) => m.role === "reasoning");
+            const isPreservedClientOnly = (m: Message) =>
+              (m.role === "activity" &&
+                (ownedActivityTypes
+                  ? !ownedActivityTypes.includes(m.activityType)
+                  : ownedActivityTypes !== null && !snapshotHasActivity)) ||
+              (m.role === "reasoning" && !snapshotHasReasoning);
 
-            // Step 3: Append messages from the snapshot that we don't have yet.
+            // A matching ID updates even when this snapshot cannot delete that
+            // activity type. Authority applies only to messages omitted from it.
+            messages = messages
+              .filter((m) => snapshotMap.has(m.id) || isPreservedClientOnly(m))
+              .map((m) => snapshotMap.get(m.id) ?? m);
+
             const existingIds = new Set(messages.map((m) => m.id));
             for (const snapshotMsg of newMessages) {
               if (!existingIds.has(snapshotMsg.id)) {
                 messages.push(snapshotMsg);
               }
             }
+            messages = keepToolResultsWithCalls(messages);
 
             applyMutation({ messages });
           }
@@ -626,25 +1177,46 @@ export const defaultApplyEvents = (
               role: "activity",
               activityType: activityEvent.activityType,
               content: structuredClone_(activityEvent.content),
+              ...(activityEvent.subagentRunId != null && {
+                subagentRunId: activityEvent.subagentRunId,
+              }),
             };
 
             let createdMessage: ActivityMessage | undefined;
+            let mergeTarget: Message | undefined;
 
             if (existingIndex === -1) {
               messages.push(activityMessage);
               createdMessage = activityMessage;
+              mergeTarget = activityMessage;
             } else if (existingActivityMessage) {
               if (replace) {
+                // Spread carries the accumulated metadata across the replace —
+                // a snapshot replaces content, not the metadata built up so far.
+                // Attribution is the exception: a replace snapshot re-mints the
+                // activity, so it brings its own subagentRunId with it (D4: a
+                // creation event's tag transfers to the message it mints). Keeping
+                // the old owner here left a subagent's replacement parent-owned —
+                // and, in the other direction, a parent snapshot could never
+                // reclaim an activity a subagent had taken.
                 messages[existingIndex] = {
                   ...existingActivityMessage,
                   activityType: activityEvent.activityType,
                   content: structuredClone_(activityEvent.content),
+                  subagentRunId: activityEvent.subagentRunId,
                 };
+                if (activityEvent.subagentRunId == null) {
+                  delete (messages[existingIndex] as { subagentRunId?: string }).subagentRunId;
+                }
               }
+              mergeTarget = messages[existingIndex];
             } else if (replace) {
               messages[existingIndex] = activityMessage;
               createdMessage = activityMessage;
+              mergeTarget = activityMessage;
             }
+
+            applyEventMetadata(mergeTarget, activityEvent);
 
             applyMutation({ messages });
 
@@ -701,6 +1273,13 @@ export const defaultApplyEvents = (
 
           if (mutation.stopPropagation !== true) {
             try {
+              // Metadata does not depend on the patch succeeding — a stale path
+              // should not cost the message its usage or trace keys — so merge
+              // it before attempting the patch and emit it either way.
+              if (applyEventMetadata(existingActivityMessage, activityEvent)) {
+                applyMutation({ messages });
+              }
+
               const baseContent = structuredClone_(existingActivityMessage.content ?? {});
 
               const result = jsonpatch.applyPatch(
@@ -711,6 +1290,7 @@ export const defaultApplyEvents = (
               );
               const updatedContent = result.newDocument as ActivityMessage["content"];
 
+              // The spread carries the metadata merged above.
               messages[existingIndex] = {
                 ...existingActivityMessage,
                 content: structuredClone_(updatedContent),
@@ -782,6 +1362,9 @@ export const defaultApplyEvents = (
               }),
           );
           applyMutation(mutation);
+          // A new run starts a new tally: pending calls are run-scoped.
+          runToolCallIds = [];
+          answeredToolCallIds = new Set<string>();
 
           // Handle input.messages if present and stopPropagation is not set
           if (mutation.stopPropagation !== true) {
@@ -790,7 +1373,16 @@ export const defaultApplyEvents = (
             // Check if the event contains input with messages
             if (runStartedEvent.input?.messages) {
               // Add messages that aren't already present (checked by ID)
-              for (const message of runStartedEvent.input.messages) {
+              for (const rawMessage of runStartedEvent.input.messages) {
+                // Same null-as-absent rule as the snapshot merge above.
+                let message = rawMessage;
+                if ((rawMessage as { subagentRunId?: string | null }).subagentRunId === null) {
+                  const copy = { ...rawMessage } as typeof rawMessage & {
+                    subagentRunId?: string | null;
+                  };
+                  delete copy.subagentRunId;
+                  message = copy as typeof rawMessage;
+                }
                 const existingMessage = messages.find((m) => m.id === message.id);
                 if (!existingMessage) {
                   messages.push(message);
@@ -807,6 +1399,8 @@ export const defaultApplyEvents = (
 
         case EventType.RUN_FINISHED: {
           const e = event as RunFinishedEvent;
+          // Absent means success; a cancelled run carries neither a result nor
+          // anything to answer, so its params are the bare event.
           const finishedParams =
             e.outcome?.type === "interrupt"
               ? ({
@@ -814,7 +1408,14 @@ export const defaultApplyEvents = (
                   outcome: "interrupt" as const,
                   interrupts: e.outcome.interrupts,
                 } as const)
-              : ({ event: e, outcome: "success" as const, result: e.result } as const);
+              : e.outcome?.type === "cancelled"
+                ? ({ event: e, outcome: "cancelled" as const } as const)
+                : ({
+                    event: e,
+                    outcome: "success" as const,
+                    result: e.result,
+                    pendingToolCallIds: pendingToolCallIdsOf(e),
+                  } as const);
           const mutation = await runSubscribersWithMutation(
             subscribers,
             messages,
@@ -838,7 +1439,16 @@ export const defaultApplyEvents = (
           if (mutation.stopPropagation !== true) {
             agent.pendingInterrupts =
               finishedParams.outcome === "interrupt"
-                ? [...finishedParams.interrupts]
+                ? finishedParams.interrupts.map((interrupt) => {
+                    if ((interrupt as { subagentRunId?: string | null }).subagentRunId !== null) {
+                      return interrupt;
+                    }
+                    const copy = { ...interrupt } as typeof interrupt & {
+                      subagentRunId?: string | null;
+                    };
+                    delete copy.subagentRunId;
+                    return copy as typeof interrupt;
+                  })
                 : [];
           }
 
@@ -903,31 +1513,11 @@ export const defaultApplyEvents = (
         }
 
         case EventType.TEXT_MESSAGE_CHUNK: {
-          throw new Error("TEXT_MESSAGE_CHUNK must be tranformed before being applied");
+          throw new Error("TEXT_MESSAGE_CHUNK must be transformed before being applied");
         }
 
         case EventType.TOOL_CALL_CHUNK: {
-          throw new Error("TOOL_CALL_CHUNK must be tranformed before being applied");
-        }
-
-        case EventType.THINKING_START: {
-          return emitUpdates();
-        }
-
-        case EventType.THINKING_END: {
-          return emitUpdates();
-        }
-
-        case EventType.THINKING_TEXT_MESSAGE_START: {
-          return emitUpdates();
-        }
-
-        case EventType.THINKING_TEXT_MESSAGE_CONTENT: {
-          return emitUpdates();
-        }
-
-        case EventType.THINKING_TEXT_MESSAGE_END: {
-          return emitUpdates();
+          throw new Error("TOOL_CALL_CHUNK must be transformed before being applied");
         }
 
         case EventType.REASONING_START: {
@@ -965,16 +1555,37 @@ export const defaultApplyEvents = (
           applyMutation(mutation);
 
           if (mutation.stopPropagation !== true) {
-            const { messageId } = event as ReasoningMessageStartEvent;
+            const { messageId, subagentRunId } = event as ReasoningMessageStartEvent;
             const existingMessage = messages.find((m) => m.id === messageId);
 
-            if (!existingMessage) {
+            if (existingMessage?.role === "activity") {
+              // Message ids are unique across the conversation, so an activity message under
+              // this id means the producer reused it. Streaming reasoning into it would
+              // overwrite its structured content with a string. Leave it alone and drop the
+              // event — and with it its metadata, which describes a reasoning message that
+              // never exists.
+              console.warn(
+                `REASONING_MESSAGE_START: Message '${messageId}' is an activity message — ` +
+                  `message ids must be unique across activity and reasoning messages`,
+              );
+              return emitUpdates();
+            }
+
+            let targetMessage = existingMessage;
+
+            if (!targetMessage) {
               const newMessage: ReasoningMessage = {
                 id: messageId,
                 role: "reasoning",
                 content: "",
+                ...(subagentRunId != null && { subagentRunId }),
               };
               messages.push(newMessage);
+              targetMessage = newMessage;
+            }
+
+            const metadataChanged = applyEventMetadata(targetMessage, event);
+            if (!existingMessage || metadataChanged) {
               applyMutation({ messages });
             }
           }
@@ -987,6 +1598,15 @@ export const defaultApplyEvents = (
           const targetMessage = messages.find((m) => m.id === messageId);
           if (!targetMessage) {
             console.warn(`REASONING_MESSAGE_CONTENT: No message found with ID '${messageId}'`);
+            return emitUpdates();
+          }
+          if (targetMessage.role === "activity") {
+            // Appending here would replace the activity message's structured content with a
+            // string, leaving it no longer a valid ActivityMessage.
+            console.warn(
+              `REASONING_MESSAGE_CONTENT: Message '${messageId}' is an activity message — ` +
+                `message ids must be unique across activity and reasoning messages`,
+            );
             return emitUpdates();
           }
 
@@ -1011,6 +1631,7 @@ export const defaultApplyEvents = (
             const existingContent =
               typeof targetMessage.content === "string" ? targetMessage.content : "";
             targetMessage.content = `${existingContent}${delta}`;
+            applyEventMetadata(targetMessage, event);
             applyMutation({ messages });
           }
           return emitUpdates();
@@ -1022,6 +1643,15 @@ export const defaultApplyEvents = (
           const targetMessage = messages.find((m) => m.id === messageId);
           if (!targetMessage) {
             console.warn(`REASONING_MESSAGE_END: No message found with ID '${messageId}'`);
+            return emitUpdates();
+          }
+          if (targetMessage.role === "activity") {
+            // The matching REASONING_MESSAGE_START was dropped for the same reason, so there
+            // is no reasoning message to finish — don't announce the activity message as one.
+            console.warn(
+              `REASONING_MESSAGE_END: Message '${messageId}' is an activity message — ` +
+                `message ids must be unique across activity and reasoning messages`,
+            );
             return emitUpdates();
           }
 
@@ -1042,9 +1672,13 @@ export const defaultApplyEvents = (
           );
           applyMutation(mutation);
 
+          if (mutation.stopPropagation !== true && applyEventMetadata(targetMessage, event)) {
+            applyMutation({ messages });
+          }
+
           await Promise.all(
             subscribers.map((subscriber) => {
-              subscriber.onNewMessage?.({
+              return subscriber.onNewMessage?.({
                 message: targetMessage,
                 messages,
                 state,
@@ -1079,6 +1713,13 @@ export const defaultApplyEvents = (
           return emitUpdates();
         }
 
+        // REASONING_ENCRYPTED_VALUE attaches an encrypted blob to an entity that
+        // already exists; it does not build one, so its metadata stays on the
+        // event, like REASONING_START and REASONING_END. That also keeps the
+        // compaction invariant intact: `compactEvents` buffers an event arriving
+        // mid-stream and flushes it *after* the END it originally preceded, so
+        // merging its metadata into the same entity would make a compacted
+        // replay disagree with the original stream.
         case EventType.REASONING_ENCRYPTED_VALUE: {
           const { subtype, entityId, encryptedValue } = event as ReasoningEncryptedValueEvent;
           const mutation = await runSubscribersWithMutation(
@@ -1125,6 +1766,60 @@ export const defaultApplyEvents = (
           }
           return emitUpdates();
         }
+
+        case EventType.SUBAGENT_STARTED: {
+          const mutation = await runSubscribersWithMutation(
+            subscribers,
+            messages,
+            state,
+            (subscriber, messages, state) =>
+              subscriber.onSubagentStartedEvent?.({
+                event: event as SubagentStartedEvent,
+                messages,
+                state,
+                agent,
+                input,
+              }),
+          );
+          applyMutation(mutation);
+          return emitUpdates();
+        }
+
+        case EventType.SUBAGENT_FINISHED: {
+          const mutation = await runSubscribersWithMutation(
+            subscribers,
+            messages,
+            state,
+            (subscriber, messages, state) =>
+              subscriber.onSubagentFinishedEvent?.({
+                event: event as SubagentFinishedEvent,
+                messages,
+                state,
+                agent,
+                input,
+              }),
+          );
+          applyMutation(mutation);
+          return emitUpdates();
+        }
+
+        case EventType.SUBAGENT_ERROR: {
+          const mutation = await runSubscribersWithMutation(
+            subscribers,
+            messages,
+            state,
+            (subscriber, messages, state) =>
+              subscriber.onSubagentErrorEvent?.({
+                event: event as SubagentErrorEvent,
+                messages,
+                state,
+                agent,
+                input,
+              }),
+          );
+          applyMutation(mutation);
+          return emitUpdates();
+        }
       }
 
       // This makes TypeScript check that the switch is exhaustive
@@ -1135,6 +1830,6 @@ export const defaultApplyEvents = (
     mergeAll(),
     // Only use defaultIfEmpty when there are subscribers to avoid emitting empty updates
     // when patches fail and there are no subscribers (like in state patching test)
-    subscribers.length > 0 ? defaultIfEmpty({} as AgentStateMutation) : (stream: any) => stream,
+    subscribers.length > 0 ? defaultIfEmpty({} as AgentStateMutation) : <T>(stream: T) => stream,
   );
 };

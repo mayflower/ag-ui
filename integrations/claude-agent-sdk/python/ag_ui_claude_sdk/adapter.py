@@ -5,11 +5,13 @@ import os
 import logging
 import json
 import uuid
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from typing import AsyncIterator, Optional, List, Dict, Any, Union, TYPE_CHECKING
 
 from ag_ui.core import (
     EventType,
+    PROTOCOL_VERSION,
     RunAgentInput,
     BaseEvent,
     AssistantMessage as AguiAssistantMessage,
@@ -47,6 +49,8 @@ from .utils import (
     strip_mcp_prefix,
     build_agui_assistant_message,
     build_agui_tool_message,
+    merge_state_update,
+    unsupported_input_parts,
     _is_state_management_tool,
     fix_surrogates,
     fix_surrogates_deep,
@@ -57,10 +61,16 @@ from .config import (
     AG_UI_MCP_SERVER_NAME,
 )
 from .handlers import (
+    SUBAGENT_TASK_TOOL_NAMES,
+    close_open_task_activities,
     handle_tool_use_block,
     handle_tool_result_block,
+    open_task_activity,
 )
 from .session import SessionWorker
+from .loopback_mcp import LoopbackMcpServer
+from .utils import recovery_user_messages
+from .recovery import unresolved_tool_uses, historical_tool_results, SessionBinding, RecoveryRun
 
 logger = logging.getLogger(__name__)
 
@@ -86,18 +96,67 @@ class ClaudeAgentAdapter:
         description: str = "",
         max_workers: int = 1000,
         worker_ttl_seconds: float = 1800,   # 30 min
-        query_timeout_seconds: Optional[float] = None,
+        query_timeout_seconds: Optional[float] = 300,   # 5 min; bounds a hung/slow worker
+        *,
+        session_binding_store=None,
+        resolve_profile=None,
+        execution_profile: str = "default",
+        defer_tools: tuple[str, ...] = (),
+        native_child_recovery=None,
     ):
         self.name = name
         self.description = description
         self._options = options
+        if (session_binding_store is None) != (resolve_profile is None):
+            raise ValueError("session_binding_store and resolve_profile must be provided together")
+        self._session_binding_store = session_binding_store
+        self._memory_bindings: Dict[str, SessionBinding] = {}
+        self._binding_last_used: Dict[str, datetime] = {}
+        self._resolve_profile = resolve_profile
+        self._execution_profile = execution_profile
+        self._defer_tools = defer_tools
+        self._native_child_recovery = native_child_recovery
         self._max_workers = max_workers
         self._worker_ttl_seconds = worker_ttl_seconds
         self._query_timeout_seconds = query_timeout_seconds
-        self._workers: Dict[str, Dict] = {}  # changed from Dict[str, SessionWorker]
+        # thread_id -> {"worker": SessionWorker, "last_used": datetime, "active": bool, "active_runs": int}
+        self._workers: Dict[str, Dict] = {}
         self._state_locks: Dict[str, asyncio.Lock] = {}
+        # Per-thread RUN-ADMISSION lock. This is a SEPARATE lock from
+        # ``_state_locks`` on purpose: ``_state_locks[thread_id]`` is acquired
+        # mid-stream by the state-management-tool path (``async with lock:`` in
+        # ``_stream_claude_sdk``), and ``asyncio.Lock`` is non-reentrant, so
+        # reusing it for run admission would self-deadlock the instant the model
+        # emits a state-update tool call. Lock ordering is fixed: the run-lock is
+        # OUTERMOST (acquired at admission, before streaming / before
+        # RUN_STARTED) and the state-lock is INNERMOST (acquired only mid-stream).
+        # No path may hold ``_state_locks`` then wait on ``_run_locks``.
+        self._run_locks: Dict[str, asyncio.Lock] = {}
         self._per_thread_state: Dict[str, Any] = {}  # thread_id -> current state
-        self._per_thread_result: Dict[str, Any] = {}  # thread_id -> last result data
+        # Per-RUN result keyed by (thread_id, run_id). ``RUN_FINISHED.result`` is
+        # per-run by definition, so it must not share a per-thread slot that a
+        # concurrent/serialized peer run could clobber.
+        self._per_run_result: Dict[tuple, Any] = {}  # (thread_id, run_id) -> result data
+        # Strong references to fire-and-forget cleanup tasks (e.g. worker.stop()
+        # during eviction). Without this the only reference is local and the
+        # event loop keeps only a weak reference, so a pending stop task can be
+        # garbage-collected mid-flight before the worker actually shuts down.
+        # We discard each task from the set when it completes. (Item 7)
+        self._pending_tasks: set = set()
+
+    def _spawn_cleanup_task(self, coro) -> "asyncio.Task":
+        """Schedule a fire-and-forget cleanup coroutine, retaining a strong
+        reference until it completes so it cannot be GC'd mid-flight."""
+        task = asyncio.create_task(coro)
+        self._pending_tasks.add(task)
+
+        def _done(t: "asyncio.Task") -> None:
+            self._pending_tasks.discard(t)
+            if t.exception() is not None:
+                logger.warning(f"Worker eviction error: {t.exception()}")
+
+        task.add_done_callback(_done)
+        return task
 
     async def interrupt(self, thread_id: Optional[str] = None) -> None:
         """Interrupt the active query for a thread, or all workers if no thread specified."""
@@ -107,15 +166,52 @@ class ClaudeAgentAdapter:
             for entry in self._workers.values():
                 await entry["worker"].interrupt()
 
+    def _drop_thread_results(self, thread_id: str) -> None:
+        """Drop every per-run result entry belonging to ``thread_id``.
+
+        ``_per_run_result`` is keyed by ``(thread_id, run_id)``; thread-scoped
+        cleanup (eviction / clear_session / error path) must purge all of a
+        thread's run results, not a single run."""
+        for key in [k for k in self._per_run_result if k[0] == thread_id]:
+            self._per_run_result.pop(key, None)
+
     async def shutdown(self) -> None:
         """Gracefully stop all session workers. Call on server shutdown."""
         for entry in list(self._workers.values()):
             await entry["worker"].stop()
         self._workers.clear()
+        self._memory_bindings.clear()
+        self._binding_last_used.clear()
         self._state_locks.clear()
+        # ``_run_locks`` is cleared ONLY here, on full adapter shutdown (no run
+        # can be in-flight or waiting past this point); it is intentionally NOT
+        # evicted per-thread — see ``_evict_workers`` for the rationale.
+        self._run_locks.clear()
+        self._per_run_result.clear()
 
     def _evict_workers(self) -> None:
-        """Evict idle workers by TTL and LRU cap."""
+        """Evict idle workers by TTL and LRU cap.
+
+        IMPORTANT: ``_run_locks[tid]`` is deliberately NOT popped here (nor on
+        ``clear_session`` / the run error path). The run-admission lock's
+        lifecycle is run SERIALIZATION, which must stay decoupled from
+        worker-cache eviction. Popping it opens an orphan race: a run B parked on
+        ``await run_lock.acquire()`` in the window after run A released the lock
+        (worker now idle, active_runs==0) but before B wakes can have its lock
+        entry popped by eviction; a later run D then ``setdefault``s a FRESH lock
+        and runs CONCURRENTLY with B — serialization defeated. Re-validating
+        identity after acquire (in ``run``) is not sufficient alone, because a
+        held/waited lock can still be popped and re-created. So we leave run-lock
+        entries resident. Only ``_run_locks`` is exempt from eviction here:
+        ``_state_locks`` IS still popped (below), because it is acquired only
+        mid-stream UNDER the run-lock, so a live run always holds the run-lock
+        while touching it and it can never be orphaned by eviction. This is
+        bounded by the number of distinct ``thread_id``
+        values seen (each maps to one tiny ``asyncio.Lock``); a future
+        ``ThreadContext`` unification (one record per thread owning worker + all
+        locks + state, reaped together) is the long-term home for bounding it —
+        do NOT add a separate reaper here now.
+        """
         now = datetime.now()
         # TTL eviction: remove idle workers older than TTL
         to_remove = [
@@ -124,11 +220,10 @@ class ClaudeAgentAdapter:
         ]
         for tid in to_remove:
             entry = self._workers.pop(tid)
-            task = asyncio.create_task(entry["worker"].stop())
-            task.add_done_callback(lambda t: t.exception() and logger.warning(f"Worker eviction error: {t.exception()}"))
+            self._spawn_cleanup_task(entry["worker"].stop())
             self._state_locks.pop(tid, None)
             self._per_thread_state.pop(tid, None)
-            self._per_thread_result.pop(tid, None)
+            self._drop_thread_results(tid)
 
         # LRU eviction: if still over cap, remove oldest idle entries
         while len(self._workers) > self._max_workers:
@@ -137,16 +232,50 @@ class ClaudeAgentAdapter:
                 break
             oldest_tid = min(idle, key=lambda x: x[1]["last_used"])[0]
             entry = self._workers.pop(oldest_tid)
-            task = asyncio.create_task(entry["worker"].stop())
-            task.add_done_callback(lambda t: t.exception() and logger.warning(f"Worker eviction error: {t.exception()}"))
+            self._spawn_cleanup_task(entry["worker"].stop())
             self._state_locks.pop(oldest_tid, None)
+            self._per_thread_state.pop(oldest_tid, None)
+            self._drop_thread_results(oldest_tid)
+
+    def _evict_memory_bindings(self) -> None:
+        now = datetime.now()
+        idle = sorted(
+            (tid for tid in self._memory_bindings
+             if not (self._run_locks.get(tid) and self._run_locks[tid].locked())),
+            key=lambda tid: self._binding_last_used[tid],
+        )
+        for tid in idle:
+            expired = (now - self._binding_last_used[tid]).total_seconds() > self._worker_ttl_seconds
+            if expired or len(self._memory_bindings) > self._max_workers:
+                self._memory_bindings.pop(tid, None)
+                self._binding_last_used.pop(tid, None)
+                entry = self._workers.pop(tid, None)
+                if entry:
+                    self._spawn_cleanup_task(entry["worker"].stop())
+                self._state_locks.pop(tid, None)
+                self._per_thread_state.pop(tid, None)
+                self._drop_thread_results(tid)
+
+    async def _save_binding(self, thread_id, binding):
+        from copy import deepcopy
+        if self._session_binding_store is not None:
+            await self._session_binding_store.save(thread_id, deepcopy(binding))
+        else:
+            self._memory_bindings[thread_id] = deepcopy(binding)
+            self._binding_last_used[thread_id] = datetime.now()
 
     async def clear_session(self, thread_id: str) -> None:
         """Stop and remove the session worker for a thread."""
+        self._memory_bindings.pop(thread_id, None)
+        self._binding_last_used.pop(thread_id, None)
         entry = self._workers.pop(thread_id, None)
         if entry:
             await entry["worker"].stop()
         self._state_locks.pop(thread_id, None)
+        # see _evict_workers: _run_locks intentionally not evicted (only full
+        # ``shutdown`` clears the map).
+        self._per_thread_state.pop(thread_id, None)
+        self._drop_thread_results(thread_id)
 
     async def run(self, input_data: RunAgentInput) -> AsyncIterator[BaseEvent]:
         """Run the agent and yield AG-UI events."""
@@ -154,29 +283,281 @@ class ClaudeAgentAdapter:
 
         thread_id = input_data.thread_id or str(uuid.uuid4())
         run_id = input_data.run_id or str(uuid.uuid4())
-        
-        self._per_thread_state[thread_id] = input_data.state
-        self._per_thread_result[thread_id] = None
-        
+        result_key = (thread_id, run_id)
+
+        # Validate and convert the prompt before touching the thread's live
+        # SessionWorker. Unsupported content is an input error, not evidence
+        # that the existing Claude CLI session is broken.
         try:
-            # Get or create worker for this thread
+            if getattr(input_data, 'resume', None) or (input_data.messages and input_data.messages[-1].role == 'tool'):
+                prompt = ""
+            else:
+                prompt, _ = process_messages(input_data)
+        except Exception as e:
+            logger.error(f"Invalid input for thread={thread_id}: {e}")
+            yield RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                thread_id=thread_id,
+                run_id=run_id,
+                message=str(e),
+            )
+            return
+
+        # ── Run-admission serialization (Fix 1) ──
+        # Acquire the per-thread RUN lock at admission — BEFORE worker.query() /
+        # RUN_STARTED — and hold it across the WHOLE run, releasing in the
+        # ``finally`` (and therefore on every ``except`` path too). Effect: a
+        # second run on the same thread_id waits here until the first emits
+        # RUN_FINISHED and releases; different thread_ids stay concurrent (the
+        # lock is per-thread). This is a DISTINCT lock from ``_state_locks``
+        # (acquired mid-stream on the state-update-tool path); reusing the
+        # non-reentrant state-lock would self-deadlock. Lock ordering is fixed:
+        # run-lock OUTERMOST, state-lock INNERMOST.
+        # Acquire the CURRENT lock entry, then re-validate identity: if the entry
+        # in ``_run_locks`` changed while we were parked (defense-in-depth against
+        # any residual repopulation race — note eviction no longer pops the lock,
+        # so this loop normally runs once), release the stale lock and retry on
+        # the current one. Loop until we hold the lock that is actually the live
+        # ``_run_locks[thread_id]``, so no two runs can ever hold "the" run-lock
+        # for the same thread at once.
+        self._evict_memory_bindings()
+        while True:
+            run_lock = self._run_locks.setdefault(thread_id, asyncio.Lock())
+            await run_lock.acquire()
+            if self._run_locks.get(thread_id) is run_lock:
+                break
+            # A different lock is now the live entry; we acquired a stale one.
+            run_lock.release()
+
+        # Re-seed per-thread state for THIS run, now that we hold the thread
+        # exclusively. Fresh ``input_data.state`` REPLACES any prior thread state
+        # (documented reset semantics); doing it under the run-lock keeps the
+        # reset per-run rather than racing a peer's seed. ``_per_run_result`` is
+        # keyed per-run so a serialized peer can never clobber it (Fix 4).
+        self._per_thread_state[thread_id] = input_data.state
+        self._per_run_result[result_key] = None
+
+        # Set True only once this run has been counted into a worker's
+        # ``active_runs`` refcount, so the ``finally`` block decrements exactly
+        # the runs it incremented. The fail-loud dead-worker-with-live-peer path
+        # below returns WITHOUT counting itself in, so it must leave this False
+        # to avoid decrementing the peer's refcount. (Item 7a)
+        counted_in = False
+        recovery = None
+        recovery_prompts = []
+        loopback = None
+
+        # Task tool calls with an AG-UI activity still open. ``_stream_claude_sdk``
+        # fills this and drains it on every path it survives, but a timeout or an
+        # exception tears that generator down mid-stream — so run(), which owns
+        # the terminal event, holds the registry and closes whatever is left
+        # before RUN_ERROR. Otherwise an aborted run leaves the subagent widget
+        # at "running" with no terminal delta behind it.
+        open_task_activities: dict = {}
+
+        try:
+            if self._native_child_recovery is not None:
+                from .native_recovery import NativeChildRecovery
+                binding = await self._session_binding_store.load(thread_id) if self._session_binding_store else self._memory_bindings.get(thread_id)
+                requested = (input_data.forwarded_props or {}).get("resume")
+                if binding and requested and requested != binding.session_id:
+                    raise ValueError("Requested session conflicts with the durable thread binding")
+                profile = binding.profile if binding else self._execution_profile
+                profile_options = await self._resolve_profile(profile) if self._resolve_profile else {}
+                options = self.build_options(input_data, thread_id=thread_id, profile_options=profile_options)
+                options.resume = binding.session_id if binding else (requested or options.resume)
+                options.session_id = None if options.resume else (options.session_id or str(uuid.uuid4()))
+                proxy = options.mcp_servers.get(AG_UI_MCP_SERVER_NAME) if isinstance(options.mcp_servers, dict) else None
+                if isinstance(proxy, dict) and proxy.get('type') == 'sdk':
+                    loopback = LoopbackMcpServer(proxy)
+                    options.mcp_servers = {**options.mcp_servers, AG_UI_MCP_SERVER_NAME: await loopback.start()}
+                async def execute_state(call):
+                    result = await create_state_management_tool().handler(call['input'])
+                    return dict(content='\n'.join(b['text'] for b in result['content']), is_error=bool(result.get('isError')))
+                native = NativeChildRecovery(self._native_child_recovery, {STATE_MANAGEMENT_TOOL_FULL_NAME: execute_state})
+                yield RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id)
+                try:
+                    async with asyncio.timeout(self._query_timeout_seconds):
+                        async for event in self._stream_claude_sdk(native.run(input_data, options, prompt), thread_id, run_id, input_data, {t.name for t in input_data.tools}, open_task_activities):
+                            yield event
+                finally:
+                    native.stop()
+                if native.session_id:
+                    await self._save_binding(thread_id, SessionBinding(native.session_id, profile))
+                result = self._per_run_result.get(result_key) or {}
+                if result.get("is_error"):
+                    raise RuntimeError(result.get("result") or "SDK run failed")
+                yield RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id=thread_id, run_id=run_id, **({"outcome": native.outcome} if native.outcome else {}))
+                return
+            if (self._session_binding_store is not None or input_data.tools or self._defer_tools
+                    or thread_id in self._memory_bindings or getattr(input_data, 'resume', None)
+                    or (input_data.messages and input_data.messages[-1].role == 'tool')):
+                from copy import deepcopy
+                from claude_agent_sdk import get_session_info, HookMatcher
+                from claude_agent_sdk import get_session_info_from_store
+                binding = deepcopy(await self._session_binding_store.load(thread_id)) if self._session_binding_store is not None else deepcopy(self._memory_bindings.get(thread_id))
+                if binding is None and self._session_binding_store is None:
+                    previous_worker = self._workers.get(thread_id, {}).get("worker")
+                    previous_session = getattr(previous_worker, "session_id", None)
+                    if previous_session:
+                        binding = SessionBinding(previous_session, self._execution_profile)
+                requested = (input_data.forwarded_props or {}).get("resume")
+                if requested and not isinstance(requested, str):
+                    raise ValueError("resume must be the original session UUID")
+                if binding and requested and requested != binding.session_id:
+                    raise ValueError("Requested session conflicts with the durable thread binding")
+                if not binding and requested:
+                    binding = SessionBinding(requested, self._execution_profile)
+                profile = binding.profile if binding else self._execution_profile
+                profile_options = await self._resolve_profile(profile) if self._resolve_profile else {}
+                from ag_ui.core import Tool
+                tools = binding.frontend_tools if binding and binding.pending and binding.frontend_tools is not None else [tool.model_dump() for tool in input_data.tools]
+                restored_input = input_data.model_copy(update={'tools': [Tool.model_validate(tool) for tool in tools]})
+                options = self.build_options(restored_input, thread_id=thread_id, profile_options=profile_options,
+                                             resolve_frontend_result=lambda name, args: recovery.resolve_frontend_result(name, args))
+                native_history = None
+                async def load_native_history():
+                    from claude_agent_sdk import get_session_messages, get_session_messages_from_store
+                    directory = str(options.cwd) if options.cwd else None
+                    if options.session_store:
+                        messages = await get_session_messages_from_store(options.session_store, binding.session_id, directory)
+                    else:
+                        messages = get_session_messages(binding.session_id, directory=directory)
+                    return messages
+                if binding and binding.pending and not binding.unsupported_pending_tools:
+                    native_history = await load_native_history()
+                    unresolved = unresolved_tool_uses(native_history)
+                    if len(unresolved) > 1 and any(call['id'] == binding.pending['id'] for call in unresolved):
+                        binding.unsupported_pending_tools = unresolved
+                        await self._save_binding(thread_id, binding)
+                async def load_history():
+                    return historical_tool_results(native_history if native_history is not None else await load_native_history())
+                recovery = await RecoveryRun.restore(binding, input_data, self._defer_tools, load_history)
+                proxy = options.mcp_servers.get(AG_UI_MCP_SERVER_NAME) if isinstance(options.mcp_servers, dict) else None
+                if isinstance(proxy, dict) and proxy.get('type') == 'sdk':
+                    loopback = LoopbackMcpServer(proxy)
+                    options.mcp_servers = {**options.mcp_servers, AG_UI_MCP_SERVER_NAME: await loopback.start()}
+                if binding:
+                    if options.fork_session or options.resume_session_at or options.continue_conversation:
+                        raise ValueError("Original-session recovery cannot fork, rewind or continue the newest session")
+                    options.resume = binding.session_id
+                    options.fork_session = False
+                    options.extra_args = {**(options.extra_args or {}), "await-initialize": None}
+                    if options.session_store:
+                        info = await get_session_info_from_store(options.session_store, binding.session_id, str(options.cwd) if options.cwd else None)
+                    else:
+                        info = get_session_info(binding.session_id, directory=str(options.cwd) if options.cwd else None)
+                    if info is None:
+                        raise ValueError("Original SDK session is unavailable. Restore its transcript/store and original working directory.")
+                if binding and binding.pending and isinstance(options.mcp_servers, dict) and any(
+                    isinstance(server, dict) and server.get('type') == 'sdk' and binding.pending['name'].startswith(f'mcp__{name}__')
+                    for name, server in options.mcp_servers.items()
+                ):
+                    raise ValueError('This SDK cannot restore a deferred in-process MCP tool before startup. The saved call is retained but is not actionable; use a supported SDK fix before resuming.')
+                if recovery.awaiting_decision:
+                    yield RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id)
+                    yield RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id=thread_id, run_id=run_id, outcome=recovery.outcome)
+                    return
+                # Save before acknowledging deferral; cancellation may never
+                # deliver a terminal result. Serialize concurrent hook saves.
+                async def durable_hook(hook_input, tool_use_id, context):
+                    async with recovery.save_lock:
+                        output = await recovery.hook(hook_input, tool_use_id, context)
+                        if recovery.checkpoint_deferred(hook_input.get('session_id'), profile):
+                            await self._save_binding(thread_id, recovery.binding)
+                        return output
+                options.hooks = {**(options.hooks or {}), "PreToolUse": [*(options.hooks or {}).get("PreToolUse", []), HookMatcher(hooks=[durable_hook])]}
+                if recovery.decision:
+                    # Resume replays the deferred call automatically. Sending an
+                    # empty user message would enqueue an extra model turn.
+                    recovery_prompts = [process_messages(input_data.model_copy(update={"messages": [message]}))[0]
+                                        for message in recovery_user_messages(input_data, binding.pending["id"])]
+                    prompt = None
+                # Recovery owns a new SDK process for each run so hooks and restored
+                # execution configuration cannot be retained from a previous run.
+                previous = self._workers.pop(thread_id, None)
+                if previous:
+                    await previous["worker"].stop()
+
+            # Get or create worker for this thread.
+            # Guard against a poisoned cache entry: if a previously-cached
+            # worker's background task has died (e.g. client.connect() failed),
+            # reusing it would hang forever on a queue nothing drains. Evict the
+            # dead worker and fall through to creating a fresh one.
             entry = self._workers.get(thread_id)
+            if entry is not None and not entry["worker"].is_alive():
+                if entry.get("active_runs", 0) > 0:
+                    # DEFENSE-IN-DEPTH / UNREACHABLE under run-admission
+                    # serialization (Fix 1): the per-thread run-lock admits one
+                    # run at a time, so while THIS run holds the lock no peer run
+                    # on the same thread can be mid-stream (``active_runs`` is
+                    # per-thread and capped at 1). This branch is retained as a
+                    # belt-and-suspenders guard in case that invariant is ever
+                    # violated by a future change. If somehow a peer IS streaming
+                    # on this (now-dead) worker, we are wedged between two
+                    # unacceptable options:
+                    #   * REUSE the dead worker — querying it would hang this
+                    #     arriving run forever (the peer's exited run-loop will
+                    #     never service our output queue).
+                    #   * EVICT (pop+stop) the shared entry — that tears the
+                    #     worker out from under the live peer (item-7 violation).
+                    # So FAIL LOUD instead: surface a descriptive RunErrorEvent
+                    # and stop, leaving the peer's entry (and its refcount)
+                    # completely untouched. ``counted_in`` stays False so the
+                    # ``finally`` block does NOT decrement the peer's refcount.
+                    logger.error(
+                        f"Worker for thread={thread_id} is dead but a peer run is "
+                        f"still active (active_runs={entry.get('active_runs')}); "
+                        f"failing this run loudly rather than reusing (hang risk) "
+                        f"or evicting (would corrupt the live peer)"
+                    )
+                    yield RunErrorEvent(
+                        type=EventType.RUN_ERROR,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        message=(
+                            f"cannot start run on thread {thread_id}: its worker "
+                            f"has terminated while another run is still active"
+                        ),
+                    )
+                    return
+                else:
+                    logger.warning(
+                        f"Evicting dead worker for thread={thread_id} (task terminated); creating fresh worker"
+                    )
+                    dead_entry = self._workers.pop(thread_id, None)
+                    if dead_entry is not None:
+                        await dead_entry["worker"].stop()
+                    self._state_locks.pop(thread_id, None)
+                    entry = None
+
             if entry is None:
-                options = self.build_options(input_data, thread_id=thread_id)
+                if recovery is None:
+                    options = self.build_options(input_data, thread_id=thread_id)
                 worker = SessionWorker(thread_id, options)
                 await worker.start()
-                entry = {"worker": worker, "last_used": datetime.now(), "active": True}
+                # ``active_runs`` is a refcount of in-flight run() invocations
+                # sharing this worker. A plain ``active`` bool wedged on
+                # concurrent reuse: the first run to finish flipped it False
+                # while a second run was still streaming, making the worker
+                # evictable mid-stream. The bool is kept (derived from the
+                # count) for callers/tests that read it. (Item 7a)
+                entry = {"worker": worker, "last_used": datetime.now(), "active": True, "active_runs": 1}
                 self._workers[thread_id] = entry
+                counted_in = True
                 self._evict_workers()
                 logger.debug(f"Created worker for thread={thread_id}")
             else:
+                entry["active_runs"] = entry.get("active_runs", 0) + 1
+                counted_in = True
                 entry["active"] = True
                 entry["last_used"] = datetime.now()
                 worker = entry["worker"]
                 logger.debug(f"Reusing worker for thread={thread_id}")
 
-            prompt, _ = process_messages(input_data)
             message_stream = worker.query(prompt, session_id=thread_id)
+            if recovery is not None:
+                message_stream = self._resume_with_user_input(worker, message_stream, recovery, thread_id, profile, recovery_prompts)
 
             # Log parent_run_id if provided (for branching/time travel tracking)
             if input_data.parent_run_id:
@@ -189,6 +570,7 @@ class ClaudeAgentAdapter:
                 type=EventType.RUN_STARTED,
                 thread_id=thread_id,
                 run_id=run_id,
+                protocol_version=PROTOCOL_VERSION,
                 parent_run_id=input_data.parent_run_id,
                 input={
                     "thread_id": thread_id,
@@ -202,6 +584,9 @@ class ClaudeAgentAdapter:
                 }
             )
             
+            for notice in unsupported_input_parts(input_data):
+                yield CustomEvent(type=EventType.CUSTOM, name="claude:unsupported_input", value=notice)
+
             # Extract frontend tool names for halt detection
             frontend_tool_names = set(extract_tool_names(input_data.tools)) if input_data.tools else set()
             if frontend_tool_names:
@@ -218,25 +603,54 @@ class ClaudeAgentAdapter:
             if self._query_timeout_seconds:
                 async with asyncio.timeout(self._query_timeout_seconds):
                     async for event in self._stream_claude_sdk(
-                        message_stream, thread_id, run_id, input_data, frontend_tool_names
+                        message_stream, thread_id, run_id, input_data,
+                        frontend_tool_names, open_task_activities,
                     ):
                         yield event
             else:
                 async for event in self._stream_claude_sdk(
-                    message_stream, thread_id, run_id, input_data, frontend_tool_names
+                    message_stream, thread_id, run_id, input_data,
+                    frontend_tool_names, open_task_activities,
                 ):
                     yield event
             
-            # Emit RUN_FINISHED
-            yield RunFinishedEvent(
-                type=EventType.RUN_FINISHED,
-                thread_id=thread_id,
-                run_id=run_id,
-                result=self._per_thread_result.get(thread_id, None),
-            )
+            # Terminal event — owned by run(), one per run. On a turn whose
+            # ResultMessage carried is_error (API failure, #2145) RUN_ERROR
+            # REPLACES RUN_FINISHED: AG-UI's verifyEvents rejects any event
+            # after RUN_ERROR, so the two terminals are mutually exclusive,
+            # matching the except paths below. The worker is NOT evicted here —
+            # the stream completed cleanly, so the CLI session stays reusable
+            # (unlike the exception paths).
+            run_result = self._per_run_result.get(result_key) or {}
+            if run_result.get("is_error"):
+                api_error_status = run_result.get("api_error_status")
+                logger.error(
+                    f"Run {run_id} on thread={thread_id} ended with an API error"
+                    + (f" (status {api_error_status})" if api_error_status is not None else "")
+                )
+                yield RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    message=run_result.get("result") or "The run ended with an API error.",
+                    code=str(api_error_status) if api_error_status is not None else None,
+                )
+            else:
+                # Emit RUN_FINISHED — read THIS run's own result (keyed per-run,
+                # so a serialized peer on the same thread cannot have clobbered
+                # it). (Fix 4)
+                yield RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    result=self._per_run_result.get(result_key, None),
+                    **({"outcome": recovery.outcome} if recovery and recovery.outcome else {}),
+                )
             
         except asyncio.TimeoutError as e:
             logger.error(f"Query timeout in run for thread={thread_id}: {e}")
+            for activity_event in close_open_task_activities(open_task_activities):
+                yield activity_event
             yield RunErrorEvent(
                 type=EventType.RUN_ERROR,
                 thread_id=thread_id,
@@ -245,11 +659,31 @@ class ClaudeAgentAdapter:
             )
         except Exception as e:
             logger.error(f"Error in run: {e}")
-            # Evict broken worker
-            broken_entry = self._workers.pop(thread_id, None)
-            if broken_entry:
-                await broken_entry["worker"].stop()
-            self._state_locks.pop(thread_id, None)
+            # Evict the broken worker — but ONLY if this is the last in-flight run
+            # sharing it. The ``active_runs > 1`` guard below is DEFENSE-IN-DEPTH /
+            # UNREACHABLE under run-admission serialization (Fix 1): the per-thread
+            # run-lock caps a thread's concurrent runs at 1, so when this run
+            # errors there is no peer run still streaming on the same thread, and
+            # the ``else`` branch (pop + stop the solo worker) is the live path.
+            # The guard is retained so that, were serialization ever broken,
+            # tearing the worker down here would not yank it out from under a peer;
+            # instead we would leave the shared entry intact and let the
+            # ``finally`` block decrement this run's refcount exactly once. (Item 7a)
+            entry = self._workers.get(thread_id)
+            if entry is not None and entry.get("active_runs", 1) > 1:
+                logger.warning(
+                    f"Run errored but a peer run is still active on thread={thread_id}; "
+                    f"keeping shared worker (active_runs={entry.get('active_runs')})"
+                )
+            else:
+                broken_entry = self._workers.pop(thread_id, None)
+                if broken_entry:
+                    await broken_entry["worker"].stop()
+                self._state_locks.pop(thread_id, None)
+                self._per_thread_state.pop(thread_id, None)
+                self._drop_thread_results(thread_id)
+            for activity_event in close_open_task_activities(open_task_activities):
+                yield activity_event
             yield RunErrorEvent(
                 type=EventType.RUN_ERROR,
                 thread_id=thread_id,
@@ -257,12 +691,83 @@ class ClaudeAgentAdapter:
                 message=str(e),
             )
         finally:
+            # Only decrement if THIS run was counted into the refcount. The
+            # fail-loud dead-worker-with-live-peer path returns early without
+            # counting itself in (``counted_in`` stays False), so it must not
+            # decrement — doing so would corrupt the live peer's refcount. (Item 7a)
             entry = self._workers.get(thread_id)
-            if entry:
-                entry["active"] = False
+            if entry and counted_in:
+                # Decrement the in-flight refcount. Under run-admission
+                # serialization (Fix 1) ``active_runs`` for a given thread is
+                # capped at 1, so this normally takes it 1 -> 0; the
+                # multi-run-sharing semantics below are DEFENSE-IN-DEPTH for the
+                # (now-unreachable) case of concurrent same-thread runs. As coded,
+                # the worker only becomes idle (and thus evictable) once ALL runs
+                # counted into it have finished, so a peer run could never be
+                # evicted mid-stream even if serialization were bypassed. (Item 7a)
+                remaining = entry.get("active_runs", 1) - 1
+                entry["active_runs"] = max(remaining, 0)
+                entry["active"] = entry["active_runs"] > 0
                 entry["last_used"] = datetime.now()
 
-    def build_options(self, input_data: Optional[RunAgentInput] = None, thread_id: Optional[str] = None) -> "ClaudeAgentOptions":
+            try:
+                if loopback is not None:
+                    # Disconnect the SDK before stopping its tool transport.
+                    owned_entry = self._workers.pop(thread_id, None)
+                    try:
+                        if owned_entry:
+                            await owned_entry['worker'].stop()
+                    finally:
+                        await loopback.close()
+            finally:
+                self._per_run_result.pop(result_key, None)
+                run_lock.release()
+                self._evict_memory_bindings()
+
+    async def _resume_with_user_input(self, worker, stream, recovery, thread_id, profile, prompts):
+        # Drain the original tool's response first. Each subsequent query is a
+        # genuine user turn on the same SDK client/session, never a Continue stub.
+        from claude_agent_sdk import ResultMessage
+        failed = False
+        async for message in self._observe_recovery(stream, recovery, thread_id, profile):
+            if isinstance(message, ResultMessage):
+                failed = message.is_error
+            yield message
+        if failed:
+            return
+        for prompt in prompts:
+            async for message in self._observe_recovery(worker.query(prompt, session_id=thread_id), recovery, thread_id, profile):
+                if isinstance(message, ResultMessage):
+                    failed = message.is_error
+                yield message
+            if failed:
+                return
+
+    async def _observe_recovery(self, stream, recovery, thread_id, profile):
+        from claude_agent_sdk import SystemMessage, ResultMessage, UserMessage, ToolResultBlock, AssistantMessage, ToolUseBlock
+        async for message in stream:
+            if isinstance(message, AssistantMessage) and message.parent_tool_use_id:
+                for block in message.content:
+                    if isinstance(block, ToolUseBlock):
+                        recovery.observe_child_tool({'id': block.id, 'name': block.name, 'input': block.input}, message.parent_tool_use_id)
+            if isinstance(message, UserMessage) and isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, ToolResultBlock) and recovery.observe_tool_result(block.tool_use_id, message.parent_tool_use_id):
+                        async with recovery.save_lock:
+                            await self._save_binding(thread_id, recovery.binding)
+            session_id = None
+            if isinstance(message, SystemMessage) and message.subtype == "init":
+                session_id = message.data.get("session_id")
+            elif isinstance(message, ResultMessage):
+                session_id = message.session_id
+            if session_id:
+                recovery.observe(session_id, profile, message if isinstance(message, ResultMessage) else None)
+                async with recovery.save_lock:
+                    await self._save_binding(thread_id, recovery.binding)
+                recovery.assert_supported()
+            yield message
+
+    def build_options(self, input_data: Optional[RunAgentInput] = None, thread_id: Optional[str] = None, profile_options=None, resolve_frontend_result=None) -> "ClaudeAgentOptions":
         """Build ClaudeAgentOptions from base config + RunAgentInput."""
         from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server
         
@@ -270,6 +775,11 @@ class ClaudeAgentAdapter:
         merged_kwargs: Dict[str, Any] = {
             "include_partial_messages": True,
             "stderr": lambda data: logger.debug(f"[Claude CLI stderr] {data.rstrip()}"),
+            # Load no filesystem settings unless the caller asks for them.
+            # claude-agent-sdk 0.2 treats an unset setting_sources as "load
+            # everything", which pulls the host's ~/.claude settings and the
+            # working directory's CLAUDE.md into every run; 0.1 loaded none.
+            "setting_sources": [],
         }
         
         # Merge in provided options
@@ -297,6 +807,9 @@ class ClaudeAgentAdapter:
                             merged_kwargs[key] = value
         logger.debug(f"Merged kwargs: {merged_kwargs}")
         
+        if profile_options is not None:
+            merged_kwargs.update(profile_options if isinstance(profile_options, dict) else vars(profile_options))
+
         # Append state and context to the system prompt (not the user message).
         if input_data:
             addendum = build_state_context_addendum(input_data)
@@ -349,7 +862,7 @@ class ClaudeAgentAdapter:
                 
                 for tool_def in input_data.tools:
                     try:
-                        claude_tool = convert_agui_tool_to_claude_sdk(tool_def)
+                        claude_tool = convert_agui_tool_to_claude_sdk(tool_def, resolve_frontend_result)
                         ag_ui_tools.append(claude_tool)
                     except Exception as e:
                         logger.warning(f"Failed to convert tool: {e}")
@@ -389,6 +902,24 @@ class ClaudeAgentAdapter:
                 )
         
         
+        # Guard against kwargs that are not valid ClaudeAgentOptions fields.
+        # forwarded_props are whitelisted by NAME (ALLOWED_FORWARDED_PROPS), but
+        # some whitelisted runtime controls (e.g. ``temperature``, ``max_tokens``)
+        # are NOT ClaudeAgentOptions dataclass fields, so passing them straight
+        # through would raise a TypeError at runtime and crash the whole run.
+        # Drop unknown keys (with a warning) so an unexpected/forwarded prop can
+        # never wedge a run. (Item 6)
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(ClaudeAgentOptions)}
+        unknown_keys = [k for k in merged_kwargs if k not in valid_fields]
+        if unknown_keys:
+            for k in unknown_keys:
+                logger.warning(
+                    f"Dropping unsupported ClaudeAgentOptions kwarg: {k!r} "
+                    f"(not a valid option field)"
+                )
+                merged_kwargs.pop(k, None)
+
         logger.debug(f"Creating ClaudeAgentOptions with merged kwargs: {merged_kwargs}")
         return ClaudeAgentOptions(**merged_kwargs)
 
@@ -399,14 +930,26 @@ class ClaudeAgentAdapter:
         run_id: str,
         input_data: RunAgentInput,
         frontend_tool_names: set[str],
+        open_task_activities: Optional[dict] = None,
     ) -> AsyncIterator[BaseEvent]:
-        """Translate a Claude SDK message stream into AG-UI events."""
+        """Translate a Claude SDK message stream into AG-UI events.
+
+        ``open_task_activities`` is the run's registry of Task tool calls with
+        an open AG-UI activity. run() passes its own, so that a timeout or an
+        exception — which tears this generator down before the cleanup block at
+        the bottom can run — still leaves run() holding what is open and able to
+        close it. A caller that passes nothing gets a fresh registry, which is
+        safe: every path this generator survives drains it in that cleanup
+        block.
+        """
         # Per-run state (local to this invocation)
         current_message_id: Optional[str] = None
+        last_streamed_message_id: Optional[str] = None
         in_reasoning_block: bool = False
         reasoning_message_id: Optional[str] = None
         has_streamed_text: bool = False
-        
+        unstreamed_fallback_ids: set[str] = set()
+
         # Tool call streaming state
         current_tool_call_id: Optional[str] = None
         current_tool_call_name: Optional[str] = None
@@ -415,9 +958,15 @@ class ClaudeAgentAdapter:
         
         # Track which tools we've already emitted START for (to avoid duplicates)
         processed_tool_ids: set = set()
+
+        # Task tool calls with an open AG-UI activity, mapped to the
+        # activity_type they were opened with, so the matching ToolResultBlock
+        # closes the right one. Per run, like processed_tool_ids above:
+        # concurrent runs must not see each other's activities, and the
+        # registry dies with the run rather than outliving it in the process.
+        if open_task_activities is None:
+            open_task_activities = {}
         
-        # Frontend tool halt flag
-        halt_event_stream: bool = False
         
         # ── MESSAGES_SNAPSHOT accumulation ──
         run_messages: List[Any] = []
@@ -477,10 +1026,6 @@ class ClaudeAgentAdapter:
         async for message in message_stream:
             message_count += 1
             
-            # If we've halted due to frontend tool, break out of loop
-            if halt_event_stream:
-                logger.debug(f"[Message #{message_count}]: Halted - breaking stream loop")
-                break
             
             logger.debug(f"[Message #{message_count}]: {type(message).__name__}")
             
@@ -490,7 +1035,8 @@ class ClaudeAgentAdapter:
                 event_type = event_data.get('type')
                 
                 if event_type == 'message_start':
-                    current_message_id = str(uuid.uuid4())
+                    current_message_id = (event_data.get("message") or {}).get("id") or str(uuid.uuid4())
+                    last_streamed_message_id = current_message_id
                     has_streamed_text = False
                     pending_msg = {"id": current_message_id, "content": "", "tool_calls": []}
                 
@@ -597,15 +1143,26 @@ class ClaudeAgentAdapter:
                             message_id=reasoning_message_id,
                         )
 
-                        # Emit encrypted signature if present
-                        if accumulated_signature and current_message_id:
+                        # Emit encrypted signature if present.
+                        #
+                        # Tie it to THIS thinking block (reasoning_message_id),
+                        # not the enclosing assistant message id. A single
+                        # message can contain multiple thinking blocks, each
+                        # with its own signature_delta; binding to the message
+                        # id (and resetting per block) attached a later block's
+                        # signature to the wrong entity. Capture the block id
+                        # before it is cleared below. (Item 2)
+                        if accumulated_signature and reasoning_message_id:
                             yield ReasoningEncryptedValueEvent(
                                 type=EventType.REASONING_ENCRYPTED_VALUE,
                                 subtype="message",
-                                entity_id=current_message_id,
+                                entity_id=reasoning_message_id,
                                 encrypted_value=accumulated_signature,
                             )
 
+                        # Reset per-block signature accumulation so the next
+                        # thinking block starts clean and cannot inherit this
+                        # block's signature.
                         accumulated_signature = ""
                         reasoning_message_id = None
                     
@@ -616,14 +1173,11 @@ class ClaudeAgentAdapter:
                             try:
                                 state_updates = json.loads(fix_surrogates(accumulated_tool_json))
                                 if isinstance(state_updates, dict):
-                                    updates = state_updates.get("state_updates", state_updates)
-                                    if isinstance(updates, str):
-                                        updates = json.loads(updates)
                                     lock = self._state_locks.setdefault(thread_id, asyncio.Lock())
                                     async with lock:
-                                        prev_state_json = json.dumps(self._per_thread_state.get(thread_id), sort_keys=True, default=str)
-                                        new_state = {**self._per_thread_state.get(thread_id), **updates} if isinstance(self._per_thread_state.get(thread_id), dict) and isinstance(updates, dict) else updates
-                                        new_state = fix_surrogates_deep(new_state)
+                                        prior = self._per_thread_state.get(thread_id)
+                                        prev_state_json = json.dumps(prior, sort_keys=True, default=str)
+                                        new_state = merge_state_update(prior, state_updates)
                                         self._per_thread_state[thread_id] = new_state
                                         if json.dumps(self._per_thread_state.get(thread_id), sort_keys=True, default=str) != prev_state_json:
                                             yield StateSnapshotEvent(
@@ -656,36 +1210,6 @@ class ClaudeAgentAdapter:
                                 )
                             )
 
-                        # Check if this is a frontend tool -- halt stream
-                        is_frontend_tool = current_tool_display_name in frontend_tool_names
-                        
-                        if is_frontend_tool:
-                            flush_pending_msg()
-
-                            yield ToolCallEndEvent(
-                                type=EventType.TOOL_CALL_END,
-                                thread_id=thread_id,
-                                run_id=run_id,
-                                tool_call_id=current_tool_call_id,
-                            )
-                            
-                            if current_message_id and has_streamed_text:
-                                yield TextMessageEndEvent(
-                                    type=EventType.TEXT_MESSAGE_END,
-                                    thread_id=thread_id,
-                                    run_id=run_id,
-                                    message_id=current_message_id,
-                                )
-                                current_message_id = None
-
-                            logger.debug(f"Frontend tool halt: {current_tool_display_name}")
-                            current_tool_call_id = None
-                            current_tool_call_name = None
-                            current_tool_display_name = None
-                            accumulated_tool_json = ""
-                            halt_event_stream = True
-                            continue
-                        
                         # Emit TOOL_CALL_END for regular backend tools
                         yield ToolCallEndEvent(
                             type=EventType.TOOL_CALL_END,
@@ -693,6 +1217,34 @@ class ClaudeAgentAdapter:
                             run_id=run_id,
                             tool_call_id=current_tool_call_id,
                         )
+
+                        # Claude's Task tool dispatches a subagent run. Open an
+                        # AG-UI activity for it so a frontend can render the
+                        # subagent distinctly. This is the path a real Task call
+                        # takes: the adapter requests include_partial_messages,
+                        # so the tool use arrives as stream events and the id is
+                        # already in processed_tool_ids by the time the complete
+                        # AssistantMessage reaches handle_tool_use_block. The
+                        # activity opens after the tool call is closed, and the
+                        # matching ToolResultBlock closes it in
+                        # handle_tool_result_block.
+                        if current_tool_call_name in SUBAGENT_TASK_TOOL_NAMES:
+                            task_input = None
+                            if accumulated_tool_json:
+                                try:
+                                    parsed_task_input = json.loads(fix_surrogates(accumulated_tool_json))
+                                    if isinstance(parsed_task_input, dict):
+                                        task_input = parsed_task_input
+                                except (json.JSONDecodeError, ValueError) as e:
+                                    # Truncated or malformed args must not lose
+                                    # the subagent from the UI — open the
+                                    # activity without them.
+                                    logger.warning(f"Failed to parse Task tool JSON: {e}")
+                            task_activity = open_task_activity(
+                                current_tool_call_id, task_input, open_task_activities
+                            )
+                            if task_activity is not None:
+                                yield task_activity
 
                         # Reset tool streaming state
                         current_tool_call_id = None
@@ -722,8 +1274,21 @@ class ClaudeAgentAdapter:
             
             # Handle complete messages
             if isinstance(message, (AssistantMessage, UserMessage)):
+                # msg_id (used below and passed to handle_tool_use_block()) —
+                # not current_message_id, which is only valid inside the
+                # streaming loop and is already None here.
+                msg_id = getattr(message, "id", None) or current_message_id or last_streamed_message_id or getattr(message, "uuid", None) or str(uuid.uuid4())
                 if isinstance(message, AssistantMessage):
-                    msg_id = current_message_id or str(uuid.uuid4())
+                    yield CustomEvent(
+                        type=EventType.CUSTOM,
+                        name="claude:assistant_content",
+                        value=fix_surrogates_deep({"messageId": msg_id, "uuid": getattr(message, "uuid", None),
+                               "parentToolUseId": getattr(message, "parent_tool_use_id", None),
+                               "content": [{"type": {"TextBlock": "text", "ThinkingBlock": "thinking", "ToolUseBlock": "tool_use", "ToolResultBlock": "tool_result"}.get(type(b).__name__, type(b).__name__), **asdict(b)} if is_dataclass(b) else b for b in message.content]}),
+                    )
+                    if current_message_id is None and last_streamed_message_id is None:
+                        unstreamed_fallback_ids.add(msg_id)
+                    last_streamed_message_id = None
                     agui_msg = build_agui_assistant_message(message, msg_id)
                     if agui_msg:
                         upsert_message(agui_msg)
@@ -735,7 +1300,9 @@ class ClaudeAgentAdapter:
                         if tool_id and tool_id in processed_tool_ids:
                             continue
                         updated_state, tool_events = await handle_tool_use_block(
-                            block, message, thread_id, run_id, self._per_thread_state.get(thread_id)
+                            block, message, thread_id, run_id, self._per_thread_state.get(thread_id),
+                            open_task_activities,
+                            parent_message_id=msg_id,
                         )
                         if tool_id:
                             processed_tool_ids.add(tool_id)
@@ -744,29 +1311,17 @@ class ClaudeAgentAdapter:
                         async for event in tool_events:
                             yield event
 
-                        # Check for frontend tool halt (same logic as streaming path)
-                        block_display_name = strip_mcp_prefix(getattr(block, 'name', '') or '')
-                        if block_display_name and block_display_name in frontend_tool_names:
-                            flush_pending_msg()
-                            if current_message_id and has_streamed_text:
-                                yield TextMessageEndEvent(
-                                    type=EventType.TEXT_MESSAGE_END,
-                                    thread_id=thread_id,
-                                    run_id=run_id,
-                                    message_id=current_message_id,
-                                )
-                                current_message_id = None
-                            logger.debug(f"Frontend tool halt (non-streaming): {block_display_name}")
-                            halt_event_stream = True
-                            break
 
                     elif isinstance(block, ToolResultBlock):
                         tool_use_id = getattr(block, 'tool_use_id', None)
                         block_content = getattr(block, 'content', None)
                         if tool_use_id:
-                            upsert_message(build_agui_tool_message(tool_use_id, block_content))
+                            upsert_message(build_agui_tool_message(tool_use_id, block_content, bool(getattr(block, "is_error", False))))
                         parent_id = getattr(message, 'parent_tool_use_id', None)
-                        async for event in handle_tool_result_block(block, thread_id, run_id, parent_id):
+                        submitted = next((item for item in input_data.messages if item.role == "tool" and item.tool_call_id == tool_use_id), None)
+                        async for event in handle_tool_result_block(block, thread_id, run_id, open_task_activities, parent_id, getattr(message, "tool_use_result", None), getattr(message, "uuid", None)):
+                            if submitted and event.type == EventType.TOOL_CALL_RESULT:
+                                event = event.model_copy(update={"message_id": submitted.id})
                             yield event
             
             elif isinstance(message, SystemMessage):
@@ -784,8 +1339,10 @@ class ClaudeAgentAdapter:
                 is_error = getattr(message, 'is_error', None)
                 result_text = getattr(message, 'result', None)
                 
-                # Capture metadata for RunFinished event
-                self._per_thread_result[thread_id] = {
+                # Capture metadata for the terminal event. Key per-run
+                # (thread_id, run_id) so a serialized peer on the same thread
+                # cannot clobber this run's result. (Fix 4)
+                run_result = {
                     "is_error": is_error,
                     "duration_ms": getattr(message, 'duration_ms', None),
                     "duration_api_ms": getattr(message, 'duration_api_ms', None),
@@ -793,15 +1350,32 @@ class ClaudeAgentAdapter:
                     "total_cost_usd": getattr(message, 'total_cost_usd', None),
                     "usage": getattr(message, 'usage', None),
                     "structured_output": getattr(message, 'structured_output', None),
+                    # Best-effort: absent from ResultMessage on claude-agent-sdk
+                    # versions predating the field (including the current pin
+                    # floor), in which case RUN_ERROR.code is None.
+                    "api_error_status": getattr(message, 'api_error_status', None),
                 }
-                
-                if not has_streamed_text and result_text:
-                    result_msg_id = str(uuid.uuid4())
+                if is_error:
+                    # Thread the failure text to run(), which owns terminal
+                    # events and emits RUN_ERROR in place of RUN_FINISHED
+                    # (#2145). Added only on errored turns so the success-path
+                    # RunFinishedEvent.result payload (emitted verbatim) is
+                    # unchanged.
+                    run_result["result"] = result_text
+                self._per_run_result[(thread_id, run_id)] = run_result
+
+                if not has_streamed_text and result_text and not is_error:
+                    # ResultMessage repeats the final AssistantMessage when
+                    # partial streaming is disabled. Reuse that message only,
+                    # never deduplicate distinct turns by their text.
+                    last_assistant = next((m for m in reversed(run_messages) if getattr(m, 'role', None) == 'assistant'), None)
+                    matching_assistant = last_assistant if last_assistant is not None and last_assistant.content == result_text else None
+                    result_msg_id = matching_assistant.id if matching_assistant is not None else str(uuid.uuid4())
                     yield TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, thread_id=thread_id, run_id=run_id, message_id=result_msg_id, role="assistant")
                     yield TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, thread_id=thread_id, run_id=run_id, message_id=result_msg_id, delta=result_text)
                     yield TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, thread_id=thread_id, run_id=run_id, message_id=result_msg_id)
 
-                    upsert_message(AguiAssistantMessage(
+                    upsert_message(matching_assistant if matching_assistant is not None else AguiAssistantMessage(
                         id=result_msg_id,
                         role="assistant",
                         content=result_text,
@@ -843,11 +1417,48 @@ class ClaudeAgentAdapter:
                 message_id=current_message_id,
             )
 
+        # A Task activity is closed by the ToolResultBlock carrying the
+        # subagent's result. If the stream ended first — interrupted, halted on
+        # a frontend tool, or a turn that ended on an error — that result never
+        # arrives, and the activity would be left at "running" with no terminal
+        # delta, so the subagent widget spins for good.
+        for activity_event in close_open_task_activities(open_task_activities):
+            logger.debug(
+                f"Cleanup: closing open subagent activity {activity_event.message_id}"
+            )
+            yield activity_event
+
         flush_pending_msg()
+
+        run_result = self._per_run_result.get((thread_id, run_id), {}) or {}
+        if run_result.get("is_error") and unstreamed_fallback_ids:
+            run_messages[:] = [m for m in run_messages if _get_msg_id(m) not in unstreamed_fallback_ids]
 
         # Emit MESSAGES_SNAPSHOT with input messages + new messages from this run
         if run_messages:
-            all_messages = list(input_data.messages or []) + run_messages
+            # The SDK echo supplies saved content/error projection while the
+            # submitted answer keeps its UI message identity.
+            def message_key(message):
+                if isinstance(message, dict):
+                    role = message.get("role")
+                    call_id = message.get("tool_call_id", message.get("toolCallId"))
+                else:
+                    role = message.role
+                    call_id = getattr(message, "tool_call_id", None)
+                return ("tool", call_id) if role == "tool" else ("message", _get_msg_id(message))
+
+            all_messages = []
+            positions = {}
+            for message in [*(input_data.messages or []), *run_messages]:
+                key = message_key(message)
+                if key in positions:
+                    index = positions[key]
+                    message_id = _get_msg_id(all_messages[index])
+                    all_messages[index] = ({**message, "id": message_id} if isinstance(message, dict)
+                                           else message.model_copy(update={"id": message_id}))
+                else:
+                    positions[key] = len(all_messages)
+                    all_messages.append(message)
             logger.debug(
                 f"MESSAGES_SNAPSHOT: {len(all_messages)} msgs ({message_count} SDK messages processed)"
             )
@@ -855,4 +1466,3 @@ class ClaudeAgentAdapter:
                 type=EventType.MESSAGES_SNAPSHOT,
                 messages=all_messages,
             )
-

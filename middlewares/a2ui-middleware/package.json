@@ -1,7 +1,12 @@
 {
   "name": "@ag-ui/a2ui-middleware",
   "author": "Markus Ecker",
-  "version": "0.0.5",
+  "version": "0.0.14",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ag-ui-protocol/ag-ui.git"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -23,10 +28,11 @@
     "unlink:global": "pnpm unlink --global"
   },
   "peerDependencies": {
-    "@ag-ui/client": ">=0.0.40",
+    "@ag-ui/client": ">=1.0.0",
     "rxjs": "7.8.1"
   },
   "dependencies": {
+    "@ag-ui/a2ui-toolkit": "workspace:*",
     "clarinet": "^0.12.6"
   },
   "devDependencies": {

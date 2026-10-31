@@ -49,9 +49,10 @@ from ag_ui_adk.session_manager import SessionManager
 from google.adk import Runner
 from google.adk.agents import Agent
 from google.adk.apps import App, ResumabilityConfig
+from tests.constants import LIVE_TEST_MODEL
 
 
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = LIVE_TEST_MODEL
 
 
 def _collect_text(events: List[BaseEvent]) -> str:
@@ -296,7 +297,7 @@ class TestStandaloneLlmAgentToolOnlyHITL:
         )
         user_id = "test_user"
         backend_session_id = resumable_standalone_agent._get_backend_session_id(
-            thread_id, user_id
+            thread_id, user_id, app_name=app_name
         )
         assert backend_session_id, "Expected a persisted backend session"
 

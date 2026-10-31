@@ -1,4 +1,5 @@
-"""Tests for interrupt detection across parallel tasks — fixes #1409.
+"""Tests for interrupt detection across parallel tasks — fixes #1409,
+and tests for _emit_interrupt_finish producing correct AG-UI protocol events.
 
 The bug is that interrupt checking only looks at tasks[0], so if a parallel
 tool call has the interrupt on tasks[1] or later, it's silently missed.
@@ -6,17 +7,26 @@ tool call has the interrupt on tasks[1] or later, it's silently missed.
 These tests call the actual LangGraphAgent._collect_interrupts() method
 so that reverting the fix in agent.py will cause test failures.
 """
+import unittest
 import pytest
 from unittest.mock import MagicMock
 from dataclasses import dataclass, field
 from typing import List, Any
 
+from ag_ui.core import (
+    EventType,
+    CustomEvent,
+    RunFinishedEvent,
+)
+
 from ag_ui_langgraph.agent import LangGraphAgent
+from ag_ui_langgraph.types import LangGraphEventTypes
 
 
 @dataclass
 class FakeInterrupt:
     value: Any
+    id: Any = None
 
 
 @dataclass
@@ -24,13 +34,14 @@ class FakeTask:
     interrupts: List[FakeInterrupt] = field(default_factory=list)
 
 
-def make_agent():
-    """Create a LangGraphAgent with a mock graph."""
+def make_agent(**agent_kwargs):
+    """Create a LangGraphAgent with a mock graph. Extra keyword arguments are
+    forwarded to ``LangGraphAgent`` (e.g. ``emit_interrupt_outcome=True``)."""
     mock_graph = MagicMock()
-    return LangGraphAgent(name="test", graph=mock_graph)
+    return LangGraphAgent(name="test", graph=mock_graph, **agent_kwargs)
 
 
-class TestCollectInterrupts:
+class TestCollectInterrupts(unittest.TestCase):
     """Test LangGraphAgent._collect_interrupts() across all tasks."""
 
     def test_single_task_with_interrupt(self):
@@ -125,9 +136,289 @@ class TestCollectInterrupts:
         """Non-task objects mixed in should not raise — only valid interrupts collected."""
         agent = make_agent()
         valid_task = FakeTask(interrupts=[FakeInterrupt(value="valid")])
-        # A plain dict without 'interrupts' key
         malformed = {}
         tasks = [valid_task, malformed]
-        # getattr on a dict returns the default, so this should not raise
         interrupts = agent._collect_interrupts(tasks)
         assert len(interrupts) == 1
+
+
+class TestEmitInterruptFinish:
+    """Test _emit_interrupt_finish produces correct AG-UI protocol events."""
+
+    def test_interrupt_finish_emits_outcome_with_legacy_on(self):
+        agent = make_agent(emit_interrupt_outcome=True)
+        agent.active_run = {"id": "run-1", "thread_id": "t1"}
+
+        lg_interrupts = [
+            FakeInterrupt(value={"reason": "confirm", "message": "ok?"}, id="int-1"),
+        ]
+
+        events = agent._emit_interrupt_finish(
+            thread_id="t1",
+            run_id="run-1",
+            lg_interrupts=lg_interrupts,
+        )
+
+        assert len(events) == 2
+
+        custom = events[0]
+        assert isinstance(custom, CustomEvent)
+        assert custom.type == EventType.CUSTOM
+        assert custom.name == LangGraphEventTypes.OnInterrupt.value
+
+        finished = events[1]
+        assert isinstance(finished, RunFinishedEvent)
+        assert finished.type == EventType.RUN_FINISHED
+        assert finished.outcome.type == "interrupt"
+        assert len(finished.outcome.interrupts) == 1
+        assert finished.outcome.interrupts[0].reason == "confirm"
+        assert finished.outcome.interrupts[0].message == "ok?"
+        assert finished.outcome.interrupts[0].id == "int-1"
+
+    def test_interrupt_finish_emits_outcome_with_legacy_off(self):
+        agent = LangGraphAgent(
+            name="test",
+            graph=MagicMock(),
+            enable_legacy_on_interrupt_event=False,
+            emit_interrupt_outcome=True,
+        )
+        agent.active_run = {"id": "run-1", "thread_id": "t1"}
+
+        lg_interrupts = [
+            FakeInterrupt(value="simple string interrupt", id="int-2"),
+        ]
+
+        events = agent._emit_interrupt_finish(
+            thread_id="t1",
+            run_id="run-1",
+            lg_interrupts=lg_interrupts,
+        )
+
+        assert len(events) == 1
+
+        custom_events = [e for e in events if isinstance(e, CustomEvent)]
+        assert len(custom_events) == 0, "No CustomEvent(on_interrupt) when legacy off"
+
+        finished = events[0]
+        assert isinstance(finished, RunFinishedEvent)
+        assert finished.outcome.type == "interrupt"
+        assert len(finished.outcome.interrupts) == 1
+        assert finished.outcome.interrupts[0].reason == "langgraph:interrupt"
+        assert finished.outcome.interrupts[0].message == "simple string interrupt"
+
+    def test_interrupt_finish_with_default_reason(self):
+        agent = LangGraphAgent(
+            name="test",
+            graph=MagicMock(),
+            enable_legacy_on_interrupt_event=False,
+            emit_interrupt_outcome=True,
+        )
+        agent.active_run = {"id": "run-1", "thread_id": "t1"}
+
+        lg_interrupts = [FakeInterrupt(value={"foo": "bar"}, id="int-3")]
+
+        events = agent._emit_interrupt_finish(
+            thread_id="t1",
+            run_id="run-1",
+            lg_interrupts=lg_interrupts,
+        )
+
+        finished = events[0]
+        assert finished.outcome.interrupts[0].reason == "langgraph:interrupt"
+
+    def test_interrupt_finish_metadata_langgraph_raw(self):
+        agent = LangGraphAgent(
+            name="test",
+            graph=MagicMock(),
+            enable_legacy_on_interrupt_event=False,
+            emit_interrupt_outcome=True,
+        )
+        agent.active_run = {"id": "run-1", "thread_id": "t1"}
+
+        lg_interrupts = [FakeInterrupt(value={"reason": "r"}, id="int-4")]
+
+        events = agent._emit_interrupt_finish(
+            thread_id="t1",
+            run_id="run-1",
+            lg_interrupts=lg_interrupts,
+        )
+
+        finished = events[0]
+        metadata = finished.outcome.interrupts[0].metadata
+        assert "langgraph" in metadata
+        assert metadata["langgraph"]["raw"] == {"reason": "r"}
+
+    def test_default_emits_plain_run_finished_without_outcome(self):
+        """Default (emit_interrupt_outcome=False) must terminate with a plain
+        RUN_FINISHED and NO structured outcome — released clients that resume via
+        the legacy command.resume channel break when they see the outcome."""
+        agent = make_agent()  # emit_interrupt_outcome defaults False
+        agent.active_run = {"id": "run-1", "thread_id": "t1"}
+
+        events = agent._emit_interrupt_finish(
+            thread_id="t1",
+            run_id="run-1",
+            lg_interrupts=[FakeInterrupt(value={"reason": "confirm"}, id="int-1")],
+        )
+
+        finished = [e for e in events if isinstance(e, RunFinishedEvent)]
+        assert len(finished) == 1
+        assert getattr(finished[0], "outcome", None) is None
+        # The interrupt is still surfaced via the legacy on_interrupt event.
+        custom_events = [e for e in events if isinstance(e, CustomEvent)]
+        assert len(custom_events) == 1
+
+
+class TestInterruptMappingHardening:
+    """Tests covering the four review hardenings on the mapping layer."""
+
+    def test_missing_lg_id_raises_rather_than_synthesises(self):
+        """Without a real LangGraph id we can't round-trip a resume answer
+        back to the originating step, so refuse the mapping outright."""
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        lg = FakeInterrupt(value="confirm", id=None)
+
+        with pytest.raises(ValueError, match="missing `id`"):
+            lg_interrupt_to_agui(lg)
+
+    def test_real_lg_id_is_used_verbatim(self):
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(FakeInterrupt(value="x", id="lg-real-42"))
+        assert result.id == "lg-real-42"
+
+    def test_empty_string_reason_is_preserved(self):
+        """An explicit reason="" must be kept (matching the TS `??`), not
+        replaced by the "langgraph:interrupt" default that `or` would force."""
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(FakeInterrupt(value={"reason": ""}, id="int-1"))
+        assert result.reason == ""
+
+    def test_missing_reason_falls_back_to_default(self):
+        """When reason is absent (None), the default still applies."""
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(FakeInterrupt(value={"message": "hi"}, id="int-1"))
+        assert result.reason == "langgraph:interrupt"
+
+    def test_empty_string_tool_call_id_is_preserved(self):
+        """`or` would drop "" → fallback; `??`-equivalent keeps it."""
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(
+            FakeInterrupt(value={"tool_call_id": ""}, id="int-1")
+        )
+        assert result.tool_call_id == ""
+
+    def test_empty_dict_response_schema_is_preserved(self):
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(
+            FakeInterrupt(value={"response_schema": {}}, id="int-1")
+        )
+        assert result.response_schema == {}
+
+    def test_camel_case_wins_over_snake_case_for_tool_call_id(self):
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        result = lg_interrupt_to_agui(
+            FakeInterrupt(
+                value={"toolCallId": "camel", "tool_call_id": "snake"},
+                id="int-1",
+            )
+        )
+        assert result.tool_call_id == "camel"
+
+
+@dataclass
+class FakeNativeInterrupt:
+    """A LangGraph >= 1.2.12 Interrupt: the schema sits next to ``value``."""
+    value: Any
+    id: Any = "int-1"
+    response_schema: Any = None
+
+
+class TestNativeResponseSchema(unittest.TestCase):
+    """``interrupt(value, response_schema=Model)`` (langgraph >= 1.2.12) puts the
+    JSON Schema on ``Interrupt.response_schema``, not inside the value. The
+    mapper reads it first and keeps the value-level keys as the fallback."""
+
+    DECISION_SCHEMA = {
+        "properties": {"approved": {"title": "Approved", "type": "boolean"}},
+        "required": ["approved"],
+        "title": "Decision",
+        "type": "object",
+    }
+
+    def map(self, lg):
+        from ag_ui_langgraph.interrupts import lg_interrupt_to_agui
+
+        return lg_interrupt_to_agui(lg)
+
+    def test_reads_the_schema_from_the_interrupt_itself(self):
+        result = self.map(FakeNativeInterrupt(
+            value={"question": "approve?"}, response_schema=self.DECISION_SCHEMA))
+        self.assertEqual(result.response_schema, self.DECISION_SCHEMA)
+
+    def test_reads_it_when_the_value_is_a_string_keeping_the_message(self):
+        result = self.map(FakeNativeInterrupt(
+            value="approve?", response_schema=self.DECISION_SCHEMA))
+        self.assertEqual(result.message, "approve?")
+        self.assertEqual(result.response_schema, self.DECISION_SCHEMA)
+
+    def test_prefers_it_over_the_keys_inside_the_value(self):
+        result = self.map(FakeNativeInterrupt(
+            value={"responseSchema": {"type": "string"},
+                   "response_schema": {"type": "number"}},
+            response_schema=self.DECISION_SCHEMA,
+        ))
+        self.assertEqual(result.response_schema, self.DECISION_SCHEMA)
+
+    def test_falls_back_to_the_value_when_it_is_none(self):
+        camel = self.map(FakeNativeInterrupt(value={"responseSchema": {"type": "string"}}))
+        snake = self.map(FakeNativeInterrupt(value={"response_schema": {"type": "number"}}))
+        self.assertEqual(camel.response_schema, {"type": "string"})
+        self.assertEqual(snake.response_schema, {"type": "number"})
+
+    def test_none_everywhere_leaves_the_schema_unset(self):
+        result = self.map(FakeNativeInterrupt(value={"question": "approve?"}))
+        self.assertIsNone(result.response_schema)
+        self.assertNotIn("responseSchema", result.model_dump(by_alias=True, exclude_none=True))
+
+    def test_older_langgraph_without_the_attribute_keeps_the_value_keys(self):
+        # FakeInterrupt has no response_schema attribute, like langgraph < 1.2.12.
+        result = self.map(FakeInterrupt(value={"response_schema": {"type": "string"}}, id="int-1"))
+        self.assertEqual(result.response_schema, {"type": "string"})
+
+    def test_preserves_an_empty_native_schema(self):
+        result = self.map(FakeNativeInterrupt(
+            value={"responseSchema": {"type": "string"}}, response_schema={}))
+        self.assertEqual(result.response_schema, {})
+
+    def test_a_non_mapping_native_schema_is_ignored(self):
+        # interrupt() always stores JSON Schema; an Interrupt built by hand can
+        # carry the Python type instead. It must not fail validation of the
+        # AG-UI interrupt: it is ignored and the value-level keys apply.
+        class Decision:
+            approved: bool
+
+        for unusable in (Decision, object()):
+            with self.subTest(unusable=unusable):
+                result = self.map(FakeNativeInterrupt(
+                    value={"response_schema": {"type": "string"}},
+                    response_schema=unusable,
+                ))
+                self.assertEqual(result.response_schema, {"type": "string"})
+
+    def test_raw_metadata_is_still_the_value_only(self):
+        result = self.map(FakeNativeInterrupt(
+            value={"question": "approve?"}, response_schema=self.DECISION_SCHEMA))
+        self.assertEqual(result.metadata["langgraph"]["raw"], {"question": "approve?"})
+
+    def test_wire_carries_camel_case_response_schema(self):
+        result = self.map(FakeNativeInterrupt(
+            value={"question": "approve?"}, response_schema=self.DECISION_SCHEMA))
+        dumped = result.model_dump(by_alias=True, exclude_none=True)
+        self.assertEqual(dumped["responseSchema"], self.DECISION_SCHEMA)

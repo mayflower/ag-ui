@@ -5,12 +5,21 @@
 import logging
 import uuid
 import warnings
-from typing import Any, Callable, Coroutine, List, Optional
+from collections.abc import Sequence
+from typing import Any, Awaitable, Callable, Coroutine, List, Mapping, Optional
 
-from ag_ui.core import EventType, RunAgentInput, RunErrorEvent
+from ag_ui.core import (
+    AssistantMessage,
+    EventType,
+    Message,
+    RunAgentInput,
+    RunErrorEvent,
+    ToolMessage,
+)
 from ag_ui.encoder import EventEncoder
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from google.adk.sessions.state import State as _ADKState
 from pydantic import BaseModel
 
 # Use ``sse-starlette`` for the SSE response so we can return a fully-formed
@@ -27,8 +36,75 @@ from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .adk_agent import ADKAgent
 from .event_translator import adk_events_to_messages
+from .session_manager import _is_processed_message_state_key
 
 logger = logging.getLogger(__name__)
+
+# ADK routes state keys carrying these prefixes to app-wide and user-wide
+# scope instead of to the session.
+_SCOPED_STATE_PREFIXES = (_ADKState.APP_PREFIX, _ADKState.USER_PREFIX)
+
+AgentResolver = Callable[[Request, RunAgentInput], Awaitable[ADKAgent | None]]
+
+
+def resolve_agent_from_message_history(
+    messages: Sequence[Message],
+    agent_registry: Mapping[str, ADKAgent],
+) -> ADKAgent | None:
+    """Resolve a tool-result resumption to its originating agent.
+
+    This helper treats ``AssistantMessage.name`` as an explicit agent registry
+    key. It scopes routing to the latest ``ToolMessage``, matches its
+    ``ToolMessage.tool_call_id`` value to prior
+    ``AssistantMessage.tool_calls[].id`` values in the same message history,
+    and returns the corresponding registry agent.
+
+    ``None`` is returned when the latest message is not a tool result, the
+    matching assistant message is absent, the assistant message has no
+    registry key in ``name``, or the key is unknown. This keeps the helper
+    conservative so the caller can safely fall back to its normal routing
+    policy.
+    """
+    if not messages or not isinstance(messages[-1], ToolMessage):
+        return None
+
+    tool_message = messages[-1]
+    for message in reversed(messages[:-1]):
+        if not isinstance(message, AssistantMessage):
+            continue
+
+        tool_call_ids = {tool_call.id for tool_call in message.tool_calls or []}
+        if tool_message.tool_call_id not in tool_call_ids:
+            continue
+
+        if not message.name:
+            return None
+        return agent_registry.get(message.name)
+
+    return None
+
+
+_SESSION_READ_ERROR_MESSAGE = (
+    "Failed to read the session for this thread from the session backend."
+)
+
+
+def _session_read_error_response(thread_id: str) -> JSONResponse:
+    """The /agents/state failure response for a session backend read.
+
+    Backend errors can name internal resources or other users' sessions, so
+    callers log the exception and the client gets this stable message.
+    """
+    return JSONResponse(
+        status_code=500,
+        content={
+            "threadId": thread_id,
+            "threadExists": False,
+            "state": {},
+            "messages": [],
+            "error": _SESSION_READ_ERROR_MESSAGE,
+        },
+    )
 
 
 def _build_run_error(message: str, code: str) -> RunErrorEvent:
@@ -39,6 +115,71 @@ def _build_run_error(message: str, code: str) -> RunErrorEvent:
     drive the error-encoding fallback path directly.
     """
     return RunErrorEvent(type=EventType.RUN_ERROR, message=message, code=code)
+
+
+async def _merge_extractor_state(
+    input_data: RunAgentInput,
+    request: Request,
+    extract_state_fn: Optional[
+        Callable[[Request, RunAgentInput], Coroutine[dict[str, Any], Any, Any]]
+    ],
+) -> RunAgentInput:
+    """Scope client state to the session, then merge extractor state over it.
+
+    ``app:``/``user:``-prefixed keys in the client-supplied state are removed
+    first, before the extractor runs and before anything is merged. Running the
+    removal ahead of both early returns matters: most deployments configure no
+    extractor at all, and a removal placed after those returns would never run
+    for them. It also means any prefixed key still present once this returns
+    came from ``extract_state_from_request``, which is server-side.
+    """
+    existing_state = input_data.state if isinstance(input_data.state, dict) else {}
+    scoped_key_count = sum(
+        1
+        for key in existing_state
+        if isinstance(key, str) and key.startswith(_SCOPED_STATE_PREFIXES)
+    )
+    if scoped_key_count:
+        logger.warning(
+            "Dropped %d app/user scoped key(s) from client-supplied state; "
+            "state sent with a run is scoped to the session. Supply app- or "
+            "user-scoped keys from extract_state_from_request instead.",
+            scoped_key_count,
+        )
+        existing_state = {
+            key: value
+            for key, value in existing_state.items()
+            if not (isinstance(key, str) and key.startswith(_SCOPED_STATE_PREFIXES))
+        }
+        input_data = input_data.model_copy(update={"state": existing_state})
+
+    if not extract_state_fn:
+        return input_data
+
+    extracted_state_dict = await extract_state_fn(request, input_data)
+    if not extracted_state_dict:
+        return input_data
+
+    merged_state = {**existing_state, **extracted_state_dict}
+    return input_data.model_copy(update={"state": merged_state})
+
+
+async def _resolve_agent(
+    default_agent: ADKAgent,
+    request: Request,
+    input_data: RunAgentInput,
+    agent_resolver: Optional[AgentResolver],
+) -> ADKAgent:
+    """Resolve the request-scoped agent, falling back to the default agent."""
+    if agent_resolver is None:
+        return default_agent
+
+    resolved_agent = await agent_resolver(request, input_data)
+    if resolved_agent is None:
+        return default_agent
+    if not isinstance(resolved_agent, ADKAgent):
+        raise TypeError("agent_resolver must return an ADKAgent instance or None")
+    return resolved_agent
 
 
 def _sse_event(raw_data: str, *, event: Optional[str] = None) -> ServerSentEvent:
@@ -68,7 +209,7 @@ async def _sse_stream(agent: "ADKAgent", input_data: RunAgentInput):
     try:
         async for event in agent.run(input_data):
             try:
-                encoded = event.model_dump_json(by_alias=True, exclude_none=True)
+                encoded = event.model_dump_json(by_alias=True)
                 logger.debug(f"HTTP Response: {encoded}")
                 yield _sse_event(encoded)
             except Exception as encoding_error:
@@ -81,7 +222,7 @@ async def _sse_stream(agent: "ADKAgent", input_data: RunAgentInput):
                 )
                 try:
                     yield _sse_event(
-                        error_event.model_dump_json(by_alias=True, exclude_none=True)
+                        error_event.model_dump_json(by_alias=True)
                     )
                 except Exception:
                     logger.error(
@@ -99,7 +240,7 @@ async def _sse_stream(agent: "ADKAgent", input_data: RunAgentInput):
                 code="AGENT_ERROR",
             )
             yield _sse_event(
-                error_event.model_dump_json(by_alias=True, exclude_none=True)
+                error_event.model_dump_json(by_alias=True)
             )
         except Exception:
             logger.error("Failed to encode agent error event, yielding basic SSE error")
@@ -230,6 +371,8 @@ def add_adk_fastapi_endpoint(
     path: str = "/",
     extract_headers: Optional[List[str]] = None,
     extract_state_from_request: Optional[Callable[[Request, RunAgentInput], Coroutine[dict[str,Any], Any, Any]]] = None,
+    agent_resolver: Optional[AgentResolver] = None,
+    **kwargs: Any,
 ):
     """Add ADK middleware endpoint to FastAPI app.
 
@@ -242,11 +385,52 @@ def add_adk_fastapi_endpoint(
             State values returned from this function will override any existing state values. 
             The RunAgentInput is provided so conflicts can be identified and resolved appropriately.
             Cannot be used with extract_headers.
+        agent_resolver: Optional async function that can select an ``ADKAgent``
+            for the request after state extraction. Returning ``None`` uses
+            the default agent.
+        **kwargs: Forwarded to ``app.post`` for the agent route (``name``,
+            ``tags``, ``operation_id``, ``dependencies``, ``include_in_schema``,
+            ...). They do not apply to the other routes this helper registers,
+            because values such as ``operation_id`` and ``name`` must stay
+            unique per operation.
 
     Note:
         This function also adds an experimental POST /agents/state endpoint for
         consumption by front-end frameworks that need to retrieve thread state and
         message history. This endpoint is subject to change in future versions.
+        When ``agent_resolver`` is configured, routing is applied to the run
+        endpoint, ``/capabilities``, and ``/agents/state`` after request state
+        extraction. Routed agents should share a session backend when continuity
+        across route switches is expected. During HITL or long-running tool
+        resumption, the resolver is responsible for returning the same agent
+        that originated the open tool call.
+
+        A resolver can pin tool-result resumptions to the agent that emitted
+        the matching tool call by treating ``AssistantMessage.name`` as the
+        agent registry key. For this convention to work, the inbound message
+        history must preserve the assistant message that created the tool call,
+        with ``name`` set to that registry key. Histories built only from live
+        reducer events may not include that key unless the client preserves it.
+
+        .. code-block:: python
+
+            from ag_ui_adk import resolve_agent_from_message_history
+
+            AGENT_REGISTRY = {
+                "supervisor": supervisor_agent,
+                "subagent1": subagent1_agent,
+            }
+
+            async def agent_resolver(request, input_data):
+                history_agent = resolve_agent_from_message_history(
+                    input_data.messages,
+                    AGENT_REGISTRY,
+                )
+                if history_agent is not None:
+                    return history_agent
+
+                state = input_data.state if isinstance(input_data.state, dict) else {}
+                return AGENT_REGISTRY.get(state.get("to_agent"))
     """
     extract_state_fn = extract_state_from_request
     if extract_headers is not None:
@@ -261,7 +445,9 @@ def add_adk_fastapi_endpoint(
         else:
             raise ValueError("Cannot use both 'extract_headers' and 'extract_state_from_request' parameters together.")
 
-    @app.post(path)
+    default_agent = agent
+
+    @app.post(path, **kwargs)
     async def adk_endpoint(input_data: RunAgentInput, request: Request):
         """ADK middleware endpoint.
 
@@ -280,14 +466,10 @@ def add_adk_fastapi_endpoint(
           continue to work without keep-alive pings (which are SSE-specific).
         """
 
-        # Extract headers into state.headers if list provided
-        if extract_state_fn:
-            extracted_state_dict = await extract_state_fn(request, input_data)
-
-            if extracted_state_dict:
-                existing_state = input_data.state if isinstance(input_data.state, dict) else {}
-                merged_state = {**existing_state, **extracted_state_dict}
-                input_data = input_data.model_copy(update={"state": merged_state})
+        input_data = await _merge_extractor_state(input_data, request, extract_state_fn)
+        agent = await _resolve_agent(
+            default_agent, request, input_data, agent_resolver
+        )
 
         # ``EventEncoder`` types ``accept`` as ``str`` (not ``Optional[str]``);
         # pass an empty string when the client didn't send an ``Accept`` header
@@ -306,14 +488,31 @@ def add_adk_fastapi_endpoint(
     capabilities_path = f"{path.rstrip('/')}/capabilities" if path != "/" else "/capabilities"
 
     @app.get(capabilities_path)
-    async def capabilities_endpoint():
+    async def capabilities_endpoint(request: Request):
         """Return the agent's declared capabilities.
 
         Allows frontend clients to discover what features the agent supports
         before initiating a run (e.g., predictive chips, suggested questions).
-        Returns an empty object when no capabilities are configured.
+        The request extractor and resolver are applied with a fixed synthetic
+        input so selection only depends on request/extractor context. Returns
+        an empty object when no capabilities are configured.
         """
         try:
+            synthetic_input = RunAgentInput(
+                thread_id="capabilities",
+                run_id="capabilities",
+                state={},
+                messages=[],
+                tools=[],
+                context=[],
+                forwarded_props=None,
+            )
+            synthetic_input = await _merge_extractor_state(
+                synthetic_input, request, extract_state_fn
+            )
+            agent = await _resolve_agent(
+                default_agent, request, synthetic_input, agent_resolver
+            )
             caps = agent.get_capabilities()
             if caps is None:
                 logger.debug("Capabilities endpoint called but no capabilities configured on agent")
@@ -367,11 +566,13 @@ def add_adk_fastapi_endpoint(
             )
 
             if extract_state_fn:
-                extracted_state_dict = await extract_state_fn(request, synthetic_input)
-                if extracted_state_dict:
-                    synthetic_input = synthetic_input.model_copy(
-                        update={"state": extracted_state_dict}
-                    )
+                synthetic_input = await _merge_extractor_state(
+                    synthetic_input, request, extract_state_fn
+                )
+
+            agent = await _resolve_agent(
+                default_agent, request, synthetic_input, agent_resolver
+            )
 
             extractor_state = (
                 synthetic_input.state if isinstance(synthetic_input.state, dict) else {}
@@ -425,7 +626,7 @@ def add_adk_fastapi_endpoint(
             session_id = None
 
             # Fast path: check cache first
-            metadata = agent._get_session_metadata(thread_id, user_id)
+            metadata = agent._get_session_metadata(thread_id, user_id, app_name=app_name)
             if metadata:
                 session_id, cached_app_name, cached_user_id = metadata
                 session = await agent._session_manager._session_service.get_session(
@@ -437,47 +638,42 @@ def add_adk_fastapi_endpoint(
                 app_name = cached_app_name
                 user_id = cached_user_id
 
-            # Cache miss - search backend by thread_id
+            # Both cold history reads and runs use the same scoped identity policy.
             if not session:
-                # O(1) direct lookup when use_thread_id_as_session_id is enabled
-                if getattr(agent._session_manager, '_use_thread_id_as_session_id', False) is True:
-                    session = await agent._session_manager.get_session(
-                        thread_id, app_name, user_id
+                try:
+                    session = await agent._session_manager.resolve_existing_session(
+                        thread_id=thread_id, app_name=app_name, user_id=user_id
                     )
-                    if session:
-                        session_id = session.id
-                        agent._session_lookup_cache[(thread_id, user_id)] = (session_id, app_name, user_id)
-
-                # Fallback to O(n) scan (always used when flag is False,
-                # also used as legacy fallback when flag is True but direct lookup misses)
-                if not session:
-                    session = await agent._session_manager._find_session_by_thread_id(
-                        app_name=app_name,
-                        user_id=user_id,
-                        thread_id=thread_id
+                except Exception:
+                    logger.exception(
+                        "Session lookup failed in /agents/state for thread %s",
+                        thread_id,
                     )
-                    if session:
-                        # Found - cache for future lookups
-                        session_id = session.id
-                        agent._session_lookup_cache[(thread_id, user_id)] = (session_id, app_name, user_id)
-
-                        # Reload session to populate events (list_sessions returns metadata only)
-                        session = await agent._session_manager._session_service.get_session(
-                            session_id=session_id,
-                            app_name=app_name,
-                            user_id=user_id
-                        )
+                    return _session_read_error_response(thread_id)
+                if session:
+                    session_id = session.id
+                    agent._session_lookup_cache[(thread_id, user_id, app_name)] = (
+                        session_id, app_name, user_id
+                    )
 
             thread_exists = session is not None
 
-            # Get state
+            # A failed read must surface as an error, not as an empty thread.
             state = {}
             if thread_exists:
-                state = await agent._session_manager.get_session_state(
-                    session_id=session_id,
-                    app_name=app_name,
-                    user_id=user_id
-                ) or {}
+                try:
+                    state = await agent._session_manager.get_session_state(
+                        session_id=session_id,
+                        app_name=app_name,
+                        user_id=user_id,
+                        raise_on_error=True,
+                    ) or {}
+                except Exception:
+                    logger.exception(
+                        "State read failed in /agents/state for thread %s",
+                        thread_id,
+                    )
+                    return _session_read_error_response(thread_id)
 
             # Get messages from session events
             messages = []
@@ -490,7 +686,10 @@ def add_adk_fastapi_endpoint(
             return JSONResponse(content={
                 "threadId": thread_id,
                 "threadExists": thread_exists,
-                "state": state,
+                "state": {
+                    key: value for key, value in state.items()
+                    if not _is_processed_message_state_key(key)
+                },
                 "messages": messages_dict
             })
 
@@ -513,6 +712,8 @@ def create_adk_app(
     path: str = "/",
     extract_headers: Optional[List[str]] = None,
     extract_state_from_request: Optional[Callable[[Request, RunAgentInput], Coroutine[dict[str,Any], Any, Any]]] = None,
+    agent_resolver: Optional[AgentResolver] = None,
+    **kwargs: Any,
 ) -> FastAPI:
     """Create a FastAPI app with ADK middleware endpoint.
 
@@ -524,10 +725,26 @@ def create_adk_app(
             State values returned from this function will override any existing state values. 
             The RunAgentInput is provided so conflicts can be identified and resolved appropriately.
             Cannot be used with extract_headers.
+        agent_resolver: Optional async function that can select an ``ADKAgent``
+            for the request after state extraction. Returning ``None`` uses
+            the default agent.
+        **kwargs: Forwarded to ``app.post`` for the agent route (``name``,
+            ``tags``, ``operation_id``, ``dependencies``, ``include_in_schema``,
+            ...). They do not apply to the other routes this helper registers,
+            because values such as ``operation_id`` and ``name`` must stay
+            unique per operation.
 
     Returns:
         FastAPI application instance
     """
     app = FastAPI(title="ADK Middleware for AG-UI Protocol")
-    add_adk_fastapi_endpoint(app, agent, path, extract_headers=extract_headers, extract_state_from_request=extract_state_from_request)
+    add_adk_fastapi_endpoint(
+        app,
+        agent,
+        path,
+        extract_headers=extract_headers,
+        extract_state_from_request=extract_state_from_request,
+        agent_resolver=agent_resolver,
+        **kwargs,
+    )
     return app

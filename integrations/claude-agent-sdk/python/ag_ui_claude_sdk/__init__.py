@@ -14,6 +14,8 @@ For full documentation on ClaudeAgentOptions, see:
 https://platform.claude.com/docs/en/agent-sdk/python
 """
 
+from importlib.metadata import version, PackageNotFoundError
+
 from .adapter import ClaudeAgentAdapter
 from .endpoint import add_claude_fastapi_endpoint
 from .config import (
@@ -21,14 +23,27 @@ from .config import (
     STATE_MANAGEMENT_TOOL_NAME,
     AG_UI_MCP_SERVER_NAME,
 )
+from .handlers import SUBAGENT_TASK_ACTIVITY_TYPE
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("ag-ui-claude-sdk")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 __all__ = [
     "ClaudeAgentAdapter",
+    "SessionBinding",
+    "SessionBindingStore",
     "add_claude_fastapi_endpoint",
     # Configuration constants
     "ALLOWED_FORWARDED_PROPS",
     "STATE_MANAGEMENT_TOOL_NAME",
     "AG_UI_MCP_SERVER_NAME",
+    # activity_type a frontend registers a subagent renderer against
+    "SUBAGENT_TASK_ACTIVITY_TYPE",
 ]
 
+
+from .recovery import SessionBinding, SessionBindingStore
+
+from .native_recovery import NativeChildRecoveryConfig
+__all__.append("NativeChildRecoveryConfig")

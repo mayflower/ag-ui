@@ -19,9 +19,11 @@ export interface HttpHeadersEvent {
 
 export type HttpEvent = HttpDataEvent | HttpHeadersEvent;
 
-export const runHttpRequest = (url: string, requestInit: RequestInit): Observable<HttpEvent> => {
+export const runHttpRequest = (
+  fetchResponse: () => Promise<Response>,
+): Observable<HttpEvent> => {
   // Defer the fetch so that it's executed when subscribed to
-  return defer(() => from(fetch(url, requestInit))).pipe(
+  return defer(() => from(fetchResponse())).pipe(
     switchMap((response) => {
       if (!response.ok) {
         const contentType = response.headers.get("content-type") || "";
@@ -32,7 +34,7 @@ export const runHttpRequest = (url: string, requestInit: RequestInit): Observabl
             if (contentType.includes("application/json")) {
               try { payload = JSON.parse(text); } catch {/* keep raw text */}
             }
-            const err: any = new Error(
+            const err: Error & { status?: number; payload?: unknown } = new Error(
               `HTTP ${response.status}: ${typeof payload === "string" ? payload : JSON.stringify(payload)}`
             );
             err.status = response.status;
@@ -54,14 +56,18 @@ export const runHttpRequest = (url: string, requestInit: RequestInit): Observabl
       }
 
       return new Observable<HttpEvent>((subscriber) => {
+        let settled = false;
         // Emit headers event first
         subscriber.next(headersEvent);
 
         (async () => {
           try {
-            while (true) {
+            while (!subscriber.closed) {
               const { done, value } = await reader.read();
-              if (done) break;
+              if (done) {
+                settled = true;
+                break;
+              }
               // Emit data event instead of raw Uint8Array
               const dataEvent: HttpDataEvent = {
                 type: HttpEventType.DATA,
@@ -71,17 +77,23 @@ export const runHttpRequest = (url: string, requestInit: RequestInit): Observabl
             }
             subscriber.complete();
           } catch (error) {
+            settled = true;
             subscriber.error(error);
           }
         })();
 
         return () => {
-          reader.cancel().catch((error) => {
+          // An errored reader rejects cancel() with the already-delivered
+          // stream error. Only early unsubscribe needs cancellation.
+          if (settled) return;
+          void reader.cancel().catch((error) => {
             if ((error as DOMException)?.name === "AbortError") {
               return;
             }
 
-            throw error;
+            // Teardown runs after the subscriber closes: there is no caller
+            // to receive a rejection from this cleanup promise.
+            console.warn("Failed to cancel HTTP response stream:", error);
           });
         };
       });

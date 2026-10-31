@@ -32,10 +32,11 @@ from ag_ui_adk import ADKAgent
 from ag_ui_adk.session_manager import SessionManager
 from google.adk.agents import Agent, LlmAgent
 from google.genai import types
+from tests.constants import LIVE_TEST_MODEL
 
 
 # Default model for live tests
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = LIVE_TEST_MODEL
 
 
 def create_mock_adk_event(text: str, is_final: bool = False, partial: bool = True):
@@ -312,7 +313,7 @@ class TestMultiTurnConversationMocked:
 
         # Mark the message as processed (simulating what happens after first run)
         adk_agent._session_manager.mark_messages_processed(
-            app_name, thread_id, ["msg_1"]
+            app_name, thread_id, ["msg_1"], user_id="test_user"
         )
 
         # Second run with both messages (msg_1 already processed)
@@ -443,21 +444,21 @@ class TestMultiTurnConversationMocked:
 
         # First batch of messages
         adk_agent._session_manager.mark_messages_processed(
-            app_name, thread_id, ["msg_1", "msg_2"]
+            app_name, thread_id, ["msg_1", "msg_2"], user_id="test_user"
         )
 
         processed = adk_agent._session_manager.get_processed_message_ids(
-            app_name, thread_id
+            app_name, thread_id, user_id="test_user"
         )
         assert processed == {"msg_1", "msg_2"}
 
         # Second batch - should accumulate
         adk_agent._session_manager.mark_messages_processed(
-            app_name, thread_id, ["msg_3", "msg_4"]
+            app_name, thread_id, ["msg_3", "msg_4"], user_id="test_user"
         )
 
         processed = adk_agent._session_manager.get_processed_message_ids(
-            app_name, thread_id
+            app_name, thread_id, user_id="test_user"
         )
         assert processed == {"msg_1", "msg_2", "msg_3", "msg_4"}
 
@@ -468,19 +469,19 @@ class TestMultiTurnConversationMocked:
 
         # Thread 1
         adk_agent._session_manager.mark_messages_processed(
-            app_name, "thread_1", ["msg_a", "msg_b"]
+            app_name, "thread_1", ["msg_a", "msg_b"], user_id="test_user"
         )
 
         # Thread 2
         adk_agent._session_manager.mark_messages_processed(
-            app_name, "thread_2", ["msg_x", "msg_y"]
+            app_name, "thread_2", ["msg_x", "msg_y"], user_id="test_user"
         )
 
         processed_1 = adk_agent._session_manager.get_processed_message_ids(
-            app_name, "thread_1"
+            app_name, "thread_1", user_id="test_user"
         )
         processed_2 = adk_agent._session_manager.get_processed_message_ids(
-            app_name, "thread_2"
+            app_name, "thread_2", user_id="test_user"
         )
 
         assert processed_1 == {"msg_a", "msg_b"}
@@ -531,7 +532,7 @@ class TestMultiTurnFallbackBehavior:
 
         # Simulate first turn: mark all messages as processed
         adk_agent._session_manager.mark_messages_processed(
-            app_name, thread_id, ["msg_1", "msg_2", "msg_3"]
+            app_name, thread_id, ["msg_1", "msg_2", "msg_3"], user_id="test_user"
         )
 
         run_input = RunAgentInput(

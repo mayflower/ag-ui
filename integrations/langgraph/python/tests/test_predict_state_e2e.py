@@ -408,5 +408,144 @@ class TestPredictStateOutcome(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(predict_state_events), 0)
 
 
+class TestToolCallResultMessageId(unittest.IsolatedAsyncioTestCase):
+    """message_id on TOOL_CALL_RESULT is ToolMessage.id, or tool_call_id when
+    the tool message has none. The adapter never writes an id into the objects
+    the tool returned (a tool may reuse them across calls); MESSAGES_SNAPSHOT
+    presents the stored tool message under the streamed id instead (see
+    LangGraphAgent._present_streamed_tool_message_ids)."""
+
+    async def test_direct_tool_end_uses_tool_call_id_when_id_absent(self):
+        """Non-Command OnToolEnd with ToolMessage.id=None falls back to
+        tool_call_id and leaves the tool's ToolMessage untouched."""
+        tool_end = _tool_end_event("my_tool", tool_call_id="tc_abc")
+        tool_msg = tool_end["data"]["output"]
+        events = [
+            _event("on_chain_start", node="model"),
+            tool_end,
+            _chain_end_event("tools", output={"messages": []}),
+        ]
+        dispatched = await _run_stream(events)
+        results = [
+            ev for ev in dispatched
+            if getattr(ev, "type", None) == EventType.TOOL_CALL_RESULT
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].message_id, "tc_abc")
+        self.assertIsNone(tool_msg.id)
+        self.assertEqual(results[0].tool_call_id, "tc_abc")
+
+    async def test_direct_tool_end_uses_tool_message_id_when_present(self):
+        """Non-Command OnToolEnd with ToolMessage.id set uses that id."""
+        from langchain_core.messages import ToolMessage
+        ev = _event(
+            "on_tool_end",
+            node="tools",
+            data={
+                "output": ToolMessage(
+                    content="Done.",
+                    tool_call_id="tc_abc",
+                    name="my_tool",
+                    id="msg_explicit_id",
+                ),
+                "input": {},
+            },
+        )
+        events = [
+            _event("on_chain_start", node="model"),
+            ev,
+            _chain_end_event("tools", output={"messages": []}),
+        ]
+        dispatched = await _run_stream(events)
+        results = [
+            ev for ev in dispatched
+            if getattr(ev, "type", None) == EventType.TOOL_CALL_RESULT
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].message_id, "msg_explicit_id")
+        self.assertEqual(results[0].tool_call_id, "tc_abc")
+
+    async def test_command_tool_end_uses_tool_call_id_when_id_absent(self):
+        """Command-style OnToolEnd with ToolMessage.id=None falls back to
+        tool_call_id and leaves the ToolMessage inside Command.update untouched."""
+        tool_end = _command_tool_end_event("my_tool", tool_call_id="tc_xyz")
+        tool_msg = tool_end["data"]["output"].update["messages"][0]
+        events = [
+            _event("on_chain_start", node="model"),
+            tool_end,
+            _chain_end_event("tools", output={"messages": []}),
+        ]
+        dispatched = await _run_stream(events)
+        results = [
+            ev for ev in dispatched
+            if getattr(ev, "type", None) == EventType.TOOL_CALL_RESULT
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].message_id, "tc_xyz")
+        self.assertIsNone(tool_msg.id)
+        self.assertEqual(results[0].tool_call_id, "tc_xyz")
+
+    async def test_command_tool_end_does_not_write_id_into_dict_entry(self):
+        """A dict-shaped tool message in Command.update without an id streams
+        under its tool_call_id, and the tool's dict is not mutated."""
+        from langgraph.types import Command
+        entry = {"type": "tool", "content": "Done.", "tool_call_id": "tc_dict", "name": "my_tool"}
+        tool_end = _event(
+            "on_tool_end",
+            node="tools",
+            data={"output": Command(update={"messages": [entry]}), "input": {}},
+        )
+        events = [
+            _event("on_chain_start", node="model"),
+            tool_end,
+            _chain_end_event("tools", output={"messages": []}),
+        ]
+        dispatched = await _run_stream(events)
+        results = [
+            ev for ev in dispatched
+            if getattr(ev, "type", None) == EventType.TOOL_CALL_RESULT
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].message_id, "tc_dict")
+        self.assertNotIn("id", entry)
+
+    async def test_command_tool_end_uses_tool_message_id_when_present(self):
+        """Command-style OnToolEnd with ToolMessage.id set uses that id."""
+        from langchain_core.messages import ToolMessage
+        from langgraph.types import Command
+        ev = _event(
+            "on_tool_end",
+            node="tools",
+            data={
+                "output": Command(
+                    update={
+                        "messages": [
+                            ToolMessage(
+                                content="Done.",
+                                tool_call_id="tc_xyz",
+                                name="my_tool",
+                                id="msg_cmd_id",
+                            )
+                        ],
+                    },
+                ),
+                "input": {},
+            },
+        )
+        events = [
+            _event("on_chain_start", node="model"),
+            ev,
+            _chain_end_event("tools", output={"messages": []}),
+        ]
+        dispatched = await _run_stream(events)
+        results = [
+            ev for ev in dispatched
+            if getattr(ev, "type", None) == EventType.TOOL_CALL_RESULT
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].message_id, "msg_cmd_id")
+        self.assertEqual(results[0].tool_call_id, "tc_xyz")
+
+
 if __name__ == "__main__":
     unittest.main()

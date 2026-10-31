@@ -10,10 +10,26 @@ import {
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { BaseMessage } from "@langchain/core/messages";
 import { DynamicStructuredTool } from "@langchain/core/tools";
+import { PROTOCOL_VERSION, TokenUsage, aggregateTokenUsage } from "@ag-ui/core";
 import { LangChainResponse, streamLangChainResponse } from "./streaming";
 import { convertAGUIToolsToLangChain } from "./tools";
 import { Observable } from "rxjs";
 import { convertAGUIMessagesToLangChain } from "./messages";
+
+/**
+ * Best-effort provider/model identity from a LangChain chat model instance.
+ * `_llmType()` is the stable provider tag (e.g. "openai", "anthropic"); the
+ * model name lives on `.model` (newer) or `.modelName` (older). Used to label
+ * token usage that the streamed chunks left unlabeled.
+ */
+function getModelIdentity(model: any): { provider?: string; model?: string } {
+  const provider = typeof model?._llmType === "function" ? model._llmType() : undefined;
+  const modelName = model?.model ?? model?.modelName;
+  return {
+    provider: typeof provider === "string" ? provider : undefined,
+    model: typeof modelName === "string" ? modelName : undefined,
+  };
+}
 
 /**
  * Parameters passed to chainFn callback
@@ -43,6 +59,11 @@ export interface ChainFnParams {
    * Run ID
    */
   runId: string;
+  /**
+   * Per-request HTTP headers forwarded from the runtime (e.g. x-aimock-context).
+   * Undefined when no headers are set on the agent instance.
+   */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -53,7 +74,9 @@ export interface LangChainAgentChainFnConfig {
    * Custom function that handles LangChain execution
    * This allows full control over chains, graphs, and custom logic
    */
-  chainFn: (params: ChainFnParams) => Promise<LangChainResponse> | LangChainResponse;
+  chainFn: (
+    params: ChainFnParams,
+  ) => Promise<LangChainResponse> | LangChainResponse;
 }
 
 /**
@@ -77,12 +100,16 @@ export interface LangChainAgentModelConfig {
 /**
  * Dual configuration: either chainFn OR model
  */
-export type LangChainAgentConfig = LangChainAgentChainFnConfig | LangChainAgentModelConfig;
+export type LangChainAgentConfig =
+  | LangChainAgentChainFnConfig
+  | LangChainAgentModelConfig;
 
 /**
  * Type guard to check if config uses chainFn pattern
  */
-function isChainFnConfig(config: LangChainAgentConfig): config is LangChainAgentChainFnConfig {
+function isChainFnConfig(
+  config: LangChainAgentConfig,
+): config is LangChainAgentChainFnConfig {
   return "chainFn" in config;
 }
 
@@ -112,6 +139,13 @@ function isChainFnConfig(config: LangChainAgentConfig): config is LangChainAgent
 export class LangChainAgent extends AbstractAgent {
   private abortController?: AbortController;
 
+  /**
+   * Per-request HTTP headers to forward to the underlying LLM provider.
+   * Set by CopilotKit Runtime via configureAgentForRequest() to propagate
+   * x-aimock-context, x-aimock-strict, x-test-id, and other forwarded headers.
+   */
+  public headers?: Record<string, string>;
+
   constructor(private config: LangChainAgentConfig) {
     super();
   }
@@ -123,6 +157,7 @@ export class LangChainAgent extends AbstractAgent {
         type: EventType.RUN_STARTED,
         threadId: input.threadId,
         runId: input.runId,
+        protocolVersion: PROTOCOL_VERSION,
       };
       subscriber.next(startEvent);
 
@@ -134,14 +169,16 @@ export class LangChainAgent extends AbstractAgent {
       (async () => {
         try {
           // Convert AG-UI messages to LangChain messages
-          const langchainMessages = convertAGUIMessagesToLangChain(input.messages);
+          const langchainMessages = convertAGUIMessagesToLangChain(
+            input.messages,
+          );
 
           // Add system message if using model config with prompt
           if (!isChainFnConfig(this.config) && this.config.prompt) {
             const systemPrompt = this.buildSystemPrompt(
               this.config.prompt,
               input.context,
-              input.state
+              input.state,
             );
             langchainMessages.unshift({
               content: systemPrompt,
@@ -150,13 +187,19 @@ export class LangChainAgent extends AbstractAgent {
           }
 
           // Convert AG-UI tools to LangChain tools
-          const langchainTools = convertAGUIToolsToLangChain(input.tools as any[]);
+          const langchainTools = convertAGUIToolsToLangChain(
+            input.tools as any[],
+          );
 
           let response: LangChainResponse;
 
+          // Provider/model labels for usage entries whose chunks didn't carry
+          // them. Known only in the direct-model pattern (we hold the model).
+          let modelIdentity: { provider?: string; model?: string } = {};
+
           // Execute based on configuration pattern
           if (isChainFnConfig(this.config)) {
-            // Pattern A: User-provided chainFn
+            // Pattern A: User-provided chainFn — expose headers so user code can forward them
             response = await this.config.chainFn({
               messages: langchainMessages,
               tools: langchainTools,
@@ -164,22 +207,48 @@ export class LangChainAgent extends AbstractAgent {
               context: input.context,
               threadId: input.threadId,
               runId: input.runId,
+              headers: this.headers,
             });
           } else {
             // Pattern B: Direct model usage
             const modelConfig = this.config as LangChainAgentModelConfig;
+            modelIdentity = getModelIdentity(modelConfig.model);
             const boundModel = modelConfig.bindToolsOptions
-              ? modelConfig.model.bindTools?.(langchainTools, modelConfig.bindToolsOptions)
+              ? modelConfig.model.bindTools?.(
+                  langchainTools,
+                  modelConfig.bindToolsOptions,
+                )
               : modelConfig.model.bindTools?.(langchainTools);
 
-            const model = boundModel || modelConfig.model;
-            response = await model.stream(langchainMessages, {
+            // `options.headers` is a provider-specific extension supported by @langchain/openai
+            // and @langchain/anthropic via their underlying SDK's RequestOptions. It is NOT
+            // part of BaseChatModel's typed surface — hence the explicit shape annotation.
+            const callOptions: {
+              signal: AbortSignal;
+              options?: { headers: Record<string, string> };
+            } = {
               signal: abortController.signal,
-            });
+            };
+
+            if (this.headers && Object.keys(this.headers).length > 0) {
+              callOptions.options = { headers: this.headers };
+            }
+
+            const model = boundModel || modelConfig.model;
+            response = await model.stream(
+              langchainMessages,
+              callOptions as Parameters<typeof model.stream>[1],
+            );
           }
 
+          // Collect provider-reported token usage as the response streams, then
+          // attach the per-(provider, model) aggregate to the terminal event.
+          const usageEntries: TokenUsage[] = [];
+
           // Stream the response and emit AG-UI events
-          for await (const event of streamLangChainResponse(response)) {
+          for await (const event of streamLangChainResponse(response, (u) =>
+            usageEntries.push(u),
+          )) {
             if (abortController.signal.aborted) {
               break;
             }
@@ -188,10 +257,24 @@ export class LangChainAgent extends AbstractAgent {
 
           // Emit RUN_FINISHED if not aborted
           if (!abortController.signal.aborted) {
+            // Fill provider/model from the configured model when the streamed
+            // chunks didn't include them (LangChain-JS streaming often omits
+            // model_name), so downstream can compare usage per provider/model.
+            const labeled = usageEntries.map((u) => ({
+              ...u,
+              ...(u.provider == null && modelIdentity.provider != null
+                ? { provider: modelIdentity.provider }
+                : {}),
+              ...(u.model == null && modelIdentity.model != null
+                ? { model: modelIdentity.model }
+                : {}),
+            }));
+            const usage = aggregateTokenUsage(labeled);
             const finishedEvent: RunFinishedEvent = {
               type: EventType.RUN_FINISHED,
               threadId: input.threadId,
               runId: input.runId,
+              ...(usage.length > 0 ? { usage } : {}),
             };
             subscriber.next(finishedEvent);
           }
@@ -226,7 +309,7 @@ export class LangChainAgent extends AbstractAgent {
   private buildSystemPrompt(
     prompt: string,
     context: Array<{ description: string; value: string }>,
-    state?: any
+    state?: any,
   ): string {
     const parts: string[] = [prompt];
 
@@ -246,7 +329,7 @@ export class LangChainAgent extends AbstractAgent {
         parts.push(
           "\n## Application State\n" +
             "This is state from the application.\n" +
-            `\`\`\`json\n${JSON.stringify(state, null, 2)}\n\`\`\`\n`
+            `\`\`\`json\n${JSON.stringify(state, null, 2)}\n\`\`\`\n`,
         );
       }
     }
@@ -255,7 +338,11 @@ export class LangChainAgent extends AbstractAgent {
   }
 
   clone(): LangChainAgent {
-    return new LangChainAgent(this.config);
+    const cloned = new LangChainAgent(this.config);
+    if (this.headers) {
+      cloned.headers = { ...this.headers };
+    }
+    return cloned;
   }
 
   abortRun(): void {

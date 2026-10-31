@@ -1,18 +1,56 @@
 [project]
 name = "ag_ui_adk"
 description = "ADK Middleware for AG-UI Protocol"
-version = "0.6.3"
+version = "0.11.1"
+license-files = ["LICENSE"]
 readme = "README.md"
 authors = [
     { name = "Mark Fogle", email = "mark@contextable.com" }
 ]
-requires-python = ">=3.10, <3.15"
+requires-python = ">=3.10, <3.16"
 dependencies = [
-    "ag-ui-protocol>=0.1.15",
-    "aiohttp>=3.12.0",
+    "ag-ui-protocol>=1.0.0",
+    # A2UI recovery/error-handling loop (OSS-158) — framework-agnostic validator +
+    # validate→retry loop shared with the LangGraph adapter and the a2ui-middleware
+    # paint gate. 0.0.3 carries the A2UIToolParams/guidelines API (OSS-248); published
+    # on PyPI, so no local source bridge is needed. The floor is 0.0.5 because every
+    # earlier release declares Requires-Python <3.15, which pip enforces (#3080); uv
+    # ignores that upper bound and would otherwise lock one of them for 3.15.
+    "ag-ui-a2ui-toolkit>=0.0.5",
+    # Framework-independent catalog/prompt rendering and JSON repair (#3121).
+    # SDK 0.9 replaced a2ui.schema with Catalog + processor/Direct JSON APIs.
+    # Keep validation in ag-ui-a2ui-toolkit: client catalogs may contain refs
+    # that a strict resolver cannot resolve. No a2ui-adk/a2ui-a2a is needed.
+    "a2ui-agent-sdk>=0.9.0,<0.10.0",
+    "a2ui-core>=0.4.0,<0.5.0",
+    # GenAI async streaming requires StreamReader.readline(max_line_length=).
+    "aiohttp>=3.14.1",
     "asyncio>=3.4.3",
     "fastapi>=0.115.2",
-    "google-adk>=1.16.0,<2.0.0",
+    # Compatible with both google-adk 1.x and 2.x.
+    # ADK 2.0 (GA 2026-05-19) preserves the public surface this middleware touches:
+    #   - Runner.__init__ signature (adds optional `node`/`auto_create_session`; existing kwargs unchanged)
+    #   - Runner._resolve_invocation_id (same signature; still used for the #1534 workaround)
+    #   - Session/Event additive only (Event gains node_info, output; we read defensively)
+    #   - BasePlugin lifecycle hooks (all 12 preserved verbatim)
+    #   - LlmAgent / SequentialAgent / LoopAgent unchanged; Workflow is NEW (detected via topology check)
+    # 2.0-specific behavior differences handled in source:
+    #   - ag-ui#1389: AGUIToolset now binds to ClientProxyToolset (delegation pattern)
+    #                 instead of being replaced wholesale, so ADK 2.0's eager Runner-time
+    #                 get_tools() cache stays valid after the placeholder is bound.
+    #   - ag-ui#1669: Workflow roots receive FunctionResponse directly in new_message
+    #                 (the #1534 pre-append workaround now only applies to LlmAgent roots,
+    #                 because Workflow._run_impl rehydrates from new_message.parts only).
+    # NodeInterruptedError (2.0-only) is a BaseException subclass, NOT an Exception, so
+    # existing `except Exception:` blocks correctly let HITL interruption propagate.
+    # Retain the adapter's verified 1.28.1 floor after the framework-independent
+    # A2UI SDK migration (the new SDK no longer depends on ADK). The middleware
+    # feature-detects the adk shape at runtime (_ADK_OVERRIDES_INVOCATION_ID,
+    # _adk_supports_streaming_fc_args) and version-gated tests skip where a feature is
+    # absent, so the whole [1.28.1, 3.0) range is genuinely supported. The lock pins
+    # 1.35.0 only as the dev/CI resolution — the version where the full suite runs
+    # unskipped — NOT a declared cap.
+    "google-adk>=1.28.1,<3.0.0",
     "pydantic>=2.11.7",
     # Primary SSE response implementation. Used unconditionally so the FastAPI
     # floor stays at >=0.115.2 (rather than the >=0.135.0 jump that would be
@@ -37,6 +75,7 @@ build-backend = "uv_build"
 [project.urls]
 Homepage = "https://github.com/ag-ui-protocol/ag-ui/tree/main/integrations/adk-middleware/python"
 Issues = "https://github.com/ag-ui-protocol/ag-ui/issues"
+Changelog = "https://github.com/ag-ui-protocol/ag-ui/blob/main/integrations/adk-middleware/python/CHANGELOG.md"
 
 
 [dependency-groups]
@@ -50,4 +89,10 @@ dev = [
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=6.2.1",
     "pytest-xdist>=3.8.0",
+    # Database fixtures need ADK's optional database dependencies on 2.x.
+    "google-adk[db]>=1.28.1,<3.0.0",
+    # SQLAlchemy's async engine (used by ADK's ``DatabaseSessionService`` in
+    # several test fixtures) requires greenlet. ``google-adk[db]`` 2.0 pulls
+    # aiosqlite but not greenlet, so we declare it explicitly here.
+    "greenlet>=3.0",
 ]

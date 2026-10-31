@@ -2,13 +2,25 @@
 import React from "react";
 import "@copilotkit/react-core/v2/styles.css";
 import "./style.css";
-import { 
+import {
   useRenderTool,
   useConfigureSuggestions,
   CopilotChat,
 } from "@copilotkit/react-core/v2";
 import { z } from "zod";
 import { CopilotKit } from "@copilotkit/react-core";
+
+/** Shape of the `get_weather` tool result once parsed out of its JSON string. */
+type WeatherResult = {
+  city?: string;
+  temperature?: number;
+  humidity?: number;
+  windSpeed?: number;
+  wind_speed?: number;
+  conditions?: string;
+  feels_like?: number;
+  feelsLike?: number;
+};
 
 interface AgenticChatProps {
   params: Promise<{
@@ -25,19 +37,22 @@ const AgenticChat: React.FC<AgenticChatProps> = ({ params }) => {
       showDevConsole={false}
       agent="backend_tool_rendering"
     >
-      <Chat />
+      <Chat integrationId={integrationId} />
     </CopilotKit>
   );
 };
 
-const Chat = () => {
+const Chat = ({ integrationId }: { integrationId: string }) => {
   useRenderTool({
-    
-    name: "get_weather",
+    name:
+      integrationId === "claude-agent-sdk-python" ||
+      integrationId === "claude-agent-sdk-typescript"
+        ? "mcp__weather__get_weather"
+        : "get_weather",
     parameters: z.object({
       location: z.string(),
-    })  ,
-    render: ({ args, result, status }: any) => {
+    }),
+    render: ({ parameters, result, status }) => {
       if (status !== "complete") {
         return (
           <div className=" bg-[#667eea] text-white p-4 rounded-lg max-w-md">
@@ -50,7 +65,7 @@ const Chat = () => {
       // string in the ToolMessage content rather than a parsed object. Normalize
       // so property access works in either case; otherwise every field falls
       // through to its `|| 0` default and the card shows 0° C.
-      let parsed: any = result;
+      let parsed: unknown = result;
       if (typeof parsed === "string") {
         try {
           parsed = JSON.parse(parsed);
@@ -58,22 +73,22 @@ const Chat = () => {
           parsed = {};
         }
       }
-      parsed = parsed ?? {};
+      const weather = (parsed ?? {}) as WeatherResult;
 
       const weatherResult: WeatherToolResult = {
-        temperature: parsed.temperature ?? 0,
-        conditions: parsed.conditions ?? "clear",
-        humidity: parsed.humidity ?? 0,
-        windSpeed: parsed.wind_speed ?? parsed.windSpeed ?? 0,
+        temperature: weather.temperature ?? 0,
+        conditions: weather.conditions ?? "clear",
+        humidity: weather.humidity ?? 0,
+        windSpeed: weather.wind_speed ?? weather.windSpeed ?? 0,
         feelsLike:
-          parsed.feels_like ?? parsed.feelsLike ?? parsed.temperature ?? 0,
+          weather.feels_like ?? weather.feelsLike ?? weather.temperature ?? 0,
       };
 
       const themeColor = getThemeColor(weatherResult.conditions);
 
       return (
         <WeatherCard
-          location={args.location}
+          location={parameters.location}
           themeColor={themeColor}
           result={weatherResult}
           status={status || "complete"}
@@ -157,7 +172,10 @@ function WeatherCard({
       <div className="bg-white/20 p-4 w-full">
         <div className="flex items-center justify-between">
           <div>
-            <h3 data-testid="weather-city" className="text-xl font-bold text-white capitalize">
+            <h3
+              data-testid="weather-city"
+              className="text-xl font-bold text-white capitalize"
+            >
               {location}
             </h3>
             <p className="text-white">Current Weather</p>
@@ -173,7 +191,9 @@ function WeatherCard({
               {((result.temperature * 9) / 5 + 32).toFixed(1)}° F
             </span>
           </div>
-          <div className="text-sm text-white capitalize">{result.conditions}</div>
+          <div className="text-sm text-white capitalize">
+            {result.conditions}
+          </div>
         </div>
 
         <div className="mt-4 pt-4 border-t border-white">
@@ -200,7 +220,10 @@ function WeatherCard({
 function WeatherIcon({ conditions }: { conditions: string }) {
   if (!conditions) return null;
 
-  if (conditions.toLowerCase().includes("clear") || conditions.toLowerCase().includes("sunny")) {
+  if (
+    conditions.toLowerCase().includes("clear") ||
+    conditions.toLowerCase().includes("sunny")
+  ) {
     return <SunIcon />;
   }
 
@@ -277,7 +300,10 @@ function CloudIcon() {
       fill="currentColor"
       className="w-14 h-14 text-gray-200"
     >
-      <path d="M7 15a4 4 0 0 1 0-8 5 5 0 0 1 10 0 4 4 0 0 1 0 8H7z" fill="currentColor" />
+      <path
+        d="M7 15a4 4 0 0 1 0-8 5 5 0 0 1 10 0 4 4 0 0 1 0 8H7z"
+        fill="currentColor"
+      />
     </svg>
   );
 }

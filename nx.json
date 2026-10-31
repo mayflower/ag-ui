@@ -14,21 +14,30 @@
       "@ag-ui/encoder",
       "@ag-ui/proto",
       "create-ag-ui-app",
+      "@ag-ui/a2ui-toolkit",
       "@ag-ui/a2a",
+      "@ag-ui/adk",
+      "@ag-ui/adk-js",
       "@ag-ui/ag2",
       "@ag-ui/agno",
+      "@ag-ui/antigravity",
+      "@ag-ui/aws-strands",
       "@ag-ui/claude-agent-sdk",
+      "@ag-ui/claude-managed-agents",
+      "@ag-ui/cloudflare-agents",
       "@ag-ui/crewai",
       "@ag-ui/langchain",
       "@ag-ui/langgraph",
       "@ag-ui/llamaindex",
       "@ag-ui/mastra",
+      "@ag-ui/omnara",
       "@ag-ui/pydantic-ai",
       "@ag-ui/spring-ai",
       "@ag-ui/watsonx",
       "@ag-ui/a2a-middleware",
       "@ag-ui/a2ui-middleware",
-      "@ag-ui/mcp-apps-middleware"
+      "@ag-ui/mcp-apps-middleware",
+      "@ag-ui/mcp-middleware"
     ]
   },
   "namedInputs": {
@@ -43,10 +52,7 @@
   },
   "targetDefaults": {
     "generate": {
-      "outputs": [
-        "{projectRoot}/src/generated"
-      ],
-      "cache": true
+      "cache": false
     },
     "build": {
       "dependsOn": [
@@ -69,9 +75,14 @@
       ],
       "cache": true
     },
-    "check-types": {
+    "typecheck": {
       "dependsOn": [
-        "^check-types"
+        "^build",
+        "generate"
+      ],
+      "inputs": [
+        "default",
+        "^production"
       ],
       "cache": true
     },
